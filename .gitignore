@@ -1,0 +1,25 @@
+# Gradle
+.gradle/
+build/
+*.class
+
+# Android generated
+fylo-android/app/build/
+fylo-android/build/
+local.properties
+
+# IDE
+.idea/
+*.iml
+*.iws
+.DS_Store
+
+# Node (if web tooling added later)
+node_modules/
+
+# PDF library downloads (fetched by ./gradlew fetchPdfLibs)
+fylo-android/app/src/main/assets/www/assets/libs/
+
+# Keystore / signing config
+*.jks
+*.keystore

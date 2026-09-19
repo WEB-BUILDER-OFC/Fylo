@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- FYLO adaptive icon foreground — F lettermark on primary blue -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Outer circle background -->
+    <path
+        android:fillColor="#4F8CFF"
+        android:pathData="M54,18 A36,36 0 1,1 53.99,18 Z"/>
+
+    <!-- F lettermark -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M41,36 L67,36 L67,42 L47,42 L47,51 L63,51 L63,57 L47,57 L47,72 L41,72 Z"/>
+
+    <!-- Accent dot -->
+    <path
+        android:fillColor="#A5C8FF"
+        android:pathData="M63,63 A3,3 0 1,1 62.99,63 Z"/>
+</vector>

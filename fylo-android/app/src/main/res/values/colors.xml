@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- FYLO brand colors — matches CSS variables -->
+    <color name="splash_background">#0B0F19</color>
+    <color name="primary">#4F8CFF</color>
+    <color name="surface">#141824</color>
+    <color name="text_primary">#F0F4FF</color>
+</resources>

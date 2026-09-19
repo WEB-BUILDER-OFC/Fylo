@@ -1,0 +1,113 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.fylo.app'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.fylo.app"
+        minSdk 26          // Android 8.0 — modern WebView, IndexedDB, ES modules
+        targetSdk 34
+        versionCode 1
+        versionName "1.0.0"
+    }
+
+    buildTypes {
+        debug {
+            debuggable true
+            applicationIdSuffix ".debug"
+        }
+        release {
+            minifyEnabled false   // Web assets are already optimised; no need to minify Java
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    buildFeatures {
+        buildConfig true   // Required: generates BuildConfig class (BuildConfig.DEBUG etc.)
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    // Treat assets/www/** as normal assets — do not compress JS/CSS
+    aaptOptions {
+        noCompress 'js', 'css', 'html', 'json', 'map', 'ttf', 'otf'
+    }
+}
+
+dependencies {
+    // Pure Java project — WebView is built into Android.
+    // AppCompat for Activity base class, window insets, and splash screen.
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+
+    // WebViewAssetLoader — serves bundled web assets over https://appassets.*
+    // so that ES modules, IndexedDB, and modern web APIs work correctly.
+    // (type="module" scripts are blocked on file:// in Android WebView.)
+    implementation 'androidx.webkit:webkit:1.8.0'
+}
+
+// ─── Kotlin stdlib version alignment ─────────────────────────────────────────
+// Kotlin 1.8+ merges stdlib-jdk7 and stdlib-jdk8 into stdlib.
+// Without this, older transitive deps can bring in the old split variants
+// alongside the new unified stdlib, causing checkDebugDuplicateClasses to fail.
+configurations.all {
+    resolutionStrategy {
+        force 'org.jetbrains.kotlin:kotlin-stdlib:1.8.22'
+        force 'org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.8.22'
+        force 'org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.8.22'
+    }
+}
+
+// ─── Sync web assets from ../../fylo-web into assets/www ──────────────────────
+// Run:  ./gradlew syncWebAssets
+// Then: ./gradlew assembleDebug
+//
+// This copies the web project into Android assets so the app ships a local copy.
+// The web project lives at ../../fylo-web (two levels up from app/ module directory:
+//   fylo-android/app/ → fylo-android/ → fylo/ → fylo-web/)
+task syncWebAssets(type: Copy) {
+    description = 'Copies FYLO web assets into Android assets/www'
+    from('../../fylo-web') {
+        include 'index.html'
+        include 'app.js'
+        include 'manifest.json'
+        include 'sw.js'
+        include 'core/**/*.js'
+        include 'features/**/*.js'
+        include 'assets/css/**'
+        include 'assets/icons/**'
+        include 'assets/libs/**'      // local PDF.js/PDF-Lib (downloaded by fetchLibs)
+    }
+    into 'src/main/assets/www'
+}
+
+// ─── Download PDF libraries locally (run once before building) ────────────────
+// Run: ./gradlew fetchPdfLibs
+// Downloads PDF.js and PDF-Lib into assets/www/assets/libs/
+// These are then bundled into the APK and served from file:///android_asset/
+task fetchPdfLibs(type: Exec) {
+    description = 'Downloads PDF.js and PDF-Lib into assets/libs for offline bundling'
+    commandLine 'bash', '-c', """
+        LIBS=src/main/assets/www/assets/libs
+        PDFJS=3.11.174
+        PDFLIB=1.17.1
+        mkdir -p "\$LIBS"
+        echo "Downloading PDF.js \$PDFJS..."
+        curl -fL "https://cdn.jsdelivr.net/npm/pdfjs-dist@\$PDFJS/build/pdf.min.js" \\
+             -o "\$LIBS/pdf.min.js"
+        curl -fL "https://cdn.jsdelivr.net/npm/pdfjs-dist@\$PDFJS/build/pdf.worker.min.js" \\
+             -o "\$LIBS/pdf.worker.min.js"
+        echo "Downloading PDF-Lib \$PDFLIB..."
+        curl -fL "https://cdn.jsdelivr.net/npm/pdf-lib@\$PDFLIB/dist/pdf-lib.min.js" \\
+             -o "\$LIBS/pdf-lib.min.js"
+        echo "Done. Libraries saved to \$LIBS/"
+    """
+}
+
+// Ensure web assets are synced before assembling
+preBuild.dependsOn syncWebAssets

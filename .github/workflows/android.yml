@@ -1,0 +1,74 @@
+name: Android CI
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Debug APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Accept Android SDK licences
+        run: yes | sdkmanager --licenses 2>/dev/null || true
+
+      - name: Install required Android SDK components
+        run: |
+          sdkmanager \
+            "platforms;android-34" \
+            "build-tools;34.0.0" \
+            "platform-tools"
+
+      - name: Grant gradlew execute permission
+        working-directory: fylo-android
+        run: chmod +x gradlew
+
+      - name: Fetch local PDF libraries (PDF.js + PDF-Lib)
+        working-directory: fylo-android
+        run: ./gradlew fetchPdfLibs --no-daemon
+
+      - name: Build debug APK
+        working-directory: fylo-android
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Verify APK exists
+        run: |
+          APK=fylo-android/app/build/outputs/apk/debug/app-debug.apk
+          if [ ! -f "$APK" ]; then
+            echo "ERROR: APK not found at $APK"; exit 1
+          fi
+          SIZE=$(stat -c%s "$APK")
+          echo "APK OK: $SIZE bytes"
+          echo "APK_PATH=$APK" >> $GITHUB_ENV
+          echo "APK_SIZE=$SIZE" >> $GITHUB_ENV
+
+      - name: Inspect APK contents (web assets check)
+        run: |
+          APK=fylo-android/app/build/outputs/apk/debug/app-debug.apk
+          echo "=== Web assets in APK ==="
+          unzip -l "$APK" | grep "assets/www" | head -30
+          echo "=== PDF libs in APK ==="
+          unzip -l "$APK" | grep "assets/libs" || echo "WARNING: no libs found"
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: fylo-debug-apk
+          path: fylo-android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 30

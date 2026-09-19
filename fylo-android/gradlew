@@ -1,0 +1,179 @@
+#!/bin/sh
+##############################################################################
+# FYLO Gradle Wrapper (shell-native, no JAR dependency)
+#
+# Reads gradle-wrapper.properties, downloads the specified Gradle distribution
+# on first run, then delegates all arguments to the real Gradle launcher.
+#
+# Identical behaviour to the JAR-based wrapper for standard usage.
+# Compatible: POSIX sh, Linux, macOS, Windows Git Bash / Cygwin.
+##############################################################################
+
+set -e
+
+# ── Locate the wrapper directory ──────────────────────────────────────────────
+app_path="$0"
+while [ -h "$app_path" ]; do
+  ls_out=$(ls -ld "$app_path")
+  link=${ls_out#*' -> '}
+  case $link in /*) app_path=$link ;; *) app_path=$(dirname "$app_path")/$link ;; esac
+done
+APP_HOME=$(cd "$(dirname "$app_path")" && pwd)
+
+WRAPPER_PROPS="$APP_HOME/gradle/wrapper/gradle-wrapper.properties"
+if [ ! -f "$WRAPPER_PROPS" ]; then
+  echo "ERROR: cannot find gradle-wrapper.properties at $WRAPPER_PROPS" >&2
+  exit 1
+fi
+
+# ── Parse gradle-wrapper.properties ──────────────────────────────────────────
+distribution_url=""
+distribution_base="GRADLE_USER_HOME"
+distribution_path="wrapper/dists"
+zip_store_base="GRADLE_USER_HOME"
+zip_store_path="wrapper/dists"
+
+while IFS='=' read -r key raw_value; do
+  # Strip comment lines and blank lines
+  case "$key" in '#'*|'') continue ;; esac
+  # Unescape \: → : (common in wrapper props on Windows)
+  value=$(printf '%s' "$raw_value" | sed 's/\\:/:/g' | tr -d '\r')
+  key=$(printf '%s' "$key" | tr -d ' \r')
+  case "$key" in
+    distributionUrl)  distribution_url="$value"  ;;
+    distributionBase) distribution_base="$value"  ;;
+    distributionPath) distribution_path="$value"  ;;
+    zipStoreBase)     zip_store_base="$value"     ;;
+    zipStorePath)     zip_store_path="$value"     ;;
+  esac
+done < "$WRAPPER_PROPS"
+
+if [ -z "$distribution_url" ]; then
+  echo "ERROR: distributionUrl not set in $WRAPPER_PROPS" >&2
+  exit 1
+fi
+
+# ── Resolve Gradle user home ──────────────────────────────────────────────────
+if [ -n "$GRADLE_USER_HOME" ]; then
+  gradle_user_home="$GRADLE_USER_HOME"
+elif [ -n "$HOME" ]; then
+  gradle_user_home="$HOME/.gradle"
+else
+  gradle_user_home="/root/.gradle"
+fi
+
+resolve_base() {
+  case "$1" in
+    GRADLE_USER_HOME) printf '%s' "$gradle_user_home" ;;
+    PROJECT)          printf '%s' "$APP_HOME" ;;
+    *)                printf '%s' "$gradle_user_home" ;;
+  esac
+}
+
+dist_root=$(resolve_base "$distribution_base")
+zip_root=$(resolve_base "$zip_store_base")
+
+# ── Derive names and paths ────────────────────────────────────────────────────
+# filename  = last path component of the URL (e.g. gradle-8.4-bin.zip)
+file_name=$(basename "$distribution_url" | sed 's/%20/ /g')
+dist_name="${file_name%.zip}"   # e.g. gradle-8.4-bin
+
+# URL hash — MD5 of the distributionUrl, lowercase hex
+# Uses Python (always available on Linux CI) with a shell fallback via md5sum
+if command -v python3 >/dev/null 2>&1; then
+  url_hash=$(python3 -c "import hashlib,sys; print(hashlib.md5(sys.argv[1].encode('utf-8')).hexdigest())" "$distribution_url")
+elif command -v md5sum >/dev/null 2>&1; then
+  url_hash=$(printf '%s' "$distribution_url" | md5sum | cut -d' ' -f1)
+elif command -v md5 >/dev/null 2>&1; then
+  url_hash=$(printf '%s' "$distribution_url" | md5)
+else
+  # Fallback: use a stable hash from the URL length + first 8 chars
+  url_hash=$(printf '%s' "$distribution_url" | cksum | awk '{printf "%08x", $1}')
+fi
+
+dist_dir="$dist_root/$distribution_path/$dist_name/$url_hash"
+zip_dir="$zip_root/$zip_store_path/$dist_name/$url_hash"
+zip_file="$zip_dir/$file_name"
+
+# ── Download if not already cached ───────────────────────────────────────────
+gradle_home=""
+
+if [ -d "$dist_dir" ]; then
+  # Find the unpacked directory (e.g. gradle-8.4)
+  for d in "$dist_dir"/gradle-*; do
+    if [ -d "$d/bin" ]; then
+      gradle_home="$d"
+      break
+    fi
+  done
+fi
+
+if [ -z "$gradle_home" ]; then
+  echo "------------------------------------------------------------"
+  echo "Gradle $dist_name not found. Downloading..."
+  echo "$distribution_url"
+  echo "------------------------------------------------------------"
+
+  mkdir -p "$zip_dir" "$dist_dir"
+
+  if command -v curl >/dev/null 2>&1; then
+    curl --fail --location --progress-bar --retry 3 \
+         --retry-delay 5 \
+         -o "$zip_file" \
+         "$distribution_url"
+  elif command -v wget >/dev/null 2>&1; then
+    wget --tries=3 --waitretry=5 -O "$zip_file" "$distribution_url"
+  else
+    echo "ERROR: neither curl nor wget is available. Install one to download Gradle." >&2
+    exit 1
+  fi
+
+  echo "Unpacking $file_name..."
+  if command -v unzip >/dev/null 2>&1; then
+    unzip -q "$zip_file" -d "$dist_dir"
+  else
+    python3 -c "
+import zipfile, sys
+with zipfile.ZipFile(sys.argv[1]) as z:
+    z.extractall(sys.argv[2])
+" "$zip_file" "$dist_dir"
+  fi
+
+  # Mark bits on all scripts in bin/
+  for bin_dir in "$dist_dir"/gradle-*/bin; do
+    [ -d "$bin_dir" ] && chmod +x "$bin_dir"/*
+  done
+
+  # Locate home
+  for d in "$dist_dir"/gradle-*; do
+    if [ -d "$d/bin" ]; then
+      gradle_home="$d"
+      break
+    fi
+  done
+
+  if [ -z "$gradle_home" ]; then
+    echo "ERROR: could not locate Gradle home in $dist_dir after unpacking." >&2
+    exit 1
+  fi
+
+  echo "Gradle installed at: $gradle_home"
+fi
+
+# ── Exec Gradle ───────────────────────────────────────────────────────────────
+case "$(uname -s)" in
+  CYGWIN*|MINGW*|MSYS*) launcher="gradle.bat" ;;
+  *)                     launcher="gradle"      ;;
+esac
+
+gradle_launcher="$gradle_home/bin/$launcher"
+if [ ! -f "$gradle_launcher" ]; then
+  echo "ERROR: Gradle launcher not found: $gradle_launcher" >&2
+  exit 1
+fi
+
+# Ulimit guard (non-fatal)
+ulimit -n 8192 2>/dev/null || true
+
+export GRADLE_USER_HOME="$gradle_user_home"
+exec "$gradle_launcher" "$@"
