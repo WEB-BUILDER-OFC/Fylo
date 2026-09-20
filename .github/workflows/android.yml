@@ -21,6 +21,9 @@ jobs:
           distribution: 'temurin'
           cache: gradle
 
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
       - name: Accept Android SDK licences
         run: yes | sdkmanager --licenses 2>/dev/null || true
 
