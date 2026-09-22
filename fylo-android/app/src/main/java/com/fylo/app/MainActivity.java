@@ -257,21 +257,6 @@ public class MainActivity extends AppCompatActivity {
             }
 
             @Override
-            public void onReceivedError(WebView view, android.webkit.WebResourceRequest req,
-                    android.webkit.WebResourceError err) {
-                super.onReceivedError(view, req, err);
-                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
-                    String desc = String.valueOf(err.getDescription());
-                    String path = req != null && req.getUrl() != null ? req.getUrl().getPath() : "?";
-                    Log.e(TAG, "JAVA: WebResourceError: " + desc + " @ " + path);
-                    String msg = "BOOT-JAVA-ERR: " + desc + " @ " + path;
-                    // Sanitize for JS string
-                    msg = msg.replace("'", "").replace("\"", "");
-                    view.evaluateJavascript("window._D&&window._D('" + msg + "')", null);
-                }
-            }
-
-            @Override
             public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
                 boolean crashed = detail.didCrash();
                 Log.e(TAG, "RENDERER GONE: didCrash=" + crashed + " count=" + sRendererCrashCount);
