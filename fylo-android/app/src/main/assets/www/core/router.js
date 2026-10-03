@@ -20,6 +20,7 @@ const log = createLogger('Router');
 
 const _routes  = new Map();  // name → { el, onEnter, onLeave }
 let   _current = null;
+let   _notifying = false;   // true only while APP_NAV is being delivered (synchronously)
 
 export const Router = {
   register(name, opts) {
@@ -29,6 +30,15 @@ export const Router = {
 
   async go(page, pushHistory = true) {
     if (!_routes.has(page)) { log.warn(`Unknown route: "${page}"`); return; }
+    // Re-entrancy guard: a handler of the APP_NAV notification must never bounce
+    // straight back into go() for the page we are already on. Without this, any
+    // listener that calls go() from APP_NAV creates an endless go() -> emit -> go()
+    // microtask chain that starves the event loop (no paint, no timers) — the
+    // permanent splash freeze. Navigating to a *different* page is still allowed.
+    if (_notifying && page === _current) {
+      log.warn(`Ignored re-entrant navigation to "${page}" from APP_NAV handler`);
+      return;
+    }
     const prev = _current;
 
     // Leave current page
@@ -50,7 +60,9 @@ export const Router = {
 
     Actions.setPage(page, prev ?? page);
     _current = page;
-    bus.emit(EVENTS.APP_NAV, { page, prev });
+    _notifying = true;
+    try { bus.emit(EVENTS.APP_NAV, { page, prev }); }
+    finally { _notifying = false; }
     log.debug(`→ ${page}`);
   },
 

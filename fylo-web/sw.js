@@ -4,7 +4,9 @@
  * Cache-first for app files. Network-first for CDN.
  */
 
-const CACHE_NAME = 'fylo-v3';
+// v4: bumped so activate() purges the 'fylo-v3' app shell, which contains the pre-fix
+// app.js/router.js (APP_NAV recursion). Bump again whenever shipped JS changes.
+const CACHE_NAME = 'fylo-v4';
 
 const STATIC_ASSETS = [
   './',

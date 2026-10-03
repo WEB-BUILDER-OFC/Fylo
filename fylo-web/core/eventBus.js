@@ -56,7 +56,8 @@ export const bus = new EventBus();
 // ── Typed event name constants (prevents typos) ───────────────────────────────
 export const EVENTS = {
   // App
-  APP_NAV:           'app:nav',
+  APP_NAV:           'app:nav',          // NOTIFICATION — emitted by Router after a navigation. Never listen-and-navigate on this.
+  APP_NAV_REQUEST:   'app:navRequest',   // REQUEST — { page, push } — handled by app.js, which calls Router.go()
   APP_TOAST:         'app:toast',
   APP_THEME_CHANGED: 'app:themeChanged',
   APP_READY:         'app:ready',

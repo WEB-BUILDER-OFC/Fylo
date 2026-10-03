@@ -129,6 +129,7 @@ async function bootstrap() {
   }
 
   bus.emit(EVENTS.APP_READY, {});
+  window._D && window._D('BOOT-16: APP_READY — bootstrap complete, main UI live');
   log.info('Bootstrap complete');
 }
 
@@ -356,8 +357,11 @@ function _wireGlobalEvents() {
     }, 200);
   });
 
-  // ── Bus: APP_NAV (modules use bus.emit instead of Router.go) ────────────
-  bus.on(EVENTS.APP_NAV, ({ page, push }) => Router.go(page, push ?? true));
+  // ── Bus: APP_NAV_REQUEST (modules may bus.emit a nav request instead of calling Router.go) ──
+  // IMPORTANT: this must NOT listen on EVENTS.APP_NAV. Router.go() *emits* APP_NAV after every
+  // navigation; listening to it here and calling Router.go() again recursed forever and froze
+  // the WebView main thread on the splash screen.
+  bus.on(EVENTS.APP_NAV_REQUEST, ({ page, push }) => Router.go(page, push ?? true));
 
   log.info('Global events wired');
 }
