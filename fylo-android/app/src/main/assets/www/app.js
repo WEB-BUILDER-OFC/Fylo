@@ -39,9 +39,6 @@ import { ToolsModule }   from './features/tools/index.js';
 import { FilesModule }   from './features/files/index.js';
 import { SettingsModule } from './features/settings/index.js';
 
-// FORENSIC: This line runs only after ALL 14 ES module imports resolve.
-// If BOOT-04 never appears in the overlay, the crash happens during module loading.
-window._D && window._D('BOOT-04: app.js executing — all imports resolved');
 
 const log = createLogger('App');
 
@@ -55,48 +52,40 @@ const APP_EVENTS = {
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
 async function bootstrap() {
   log.info(`FYLO starting`);
-  window._D && window._D('BOOT-05: bootstrap() entered');
 
   // 1. Storage
   try {
-    window._D && window._D('BOOT-06: initStorage starting');
     await initStorage();
     log.info('Storage ready');
-    window._D && window._D('BOOT-07: Storage ready');
   } catch (e) {
-    window._D && window._D('BOOT-07F: Storage FAILED: '+e.message);
     log.error('Storage init failed:', e);
     toast('Storage unavailable — files will not persist');
   }
 
   // 2. Libraries — load in background, features await internally
-  window._D && window._D('BOOT-08: Libs.init() starting (fire-and-forget)');
   Libs.init();
 
   // 3. Settings
-  window._D && window._D('BOOT-09: SettingsModule.load starting');
   await SettingsModule.load();
-  window._D && window._D('BOOT-10: SettingsModule.load done');
 
   // 4. Persisted files
-  window._D && window._D('BOOT-11: _loadPersistedFiles starting');
   await _loadPersistedFiles();
-  window._D && window._D('BOOT-12: _loadPersistedFiles done');
 
   // 5. Register routes
-  window._D && window._D('BOOT-13: sync steps starting');
   _registerRoutes();
 
   // 6. Each module wires its own toolbar (no app.js DOM refs for features)
-  wireReaderToolbar();
-  wireEditorToolbar();
-  SettingsModule.init();
+  _safeWire('search',         _wireSearch);
+  _safeWire('manage',         _wireManage);
+  _safeWire('reader toolbar', wireReaderToolbar);
+  _safeWire('editor toolbar', wireEditorToolbar);
+  _safeWire('settings',       () => SettingsModule.init());
 
   // 7. Global events
-  _wireGlobalEvents();
+  _safeWire('global events',  _wireGlobalEvents);
 
   // 8. Gesture engine (reader touch/mouse/wheel)
-  initGestureEngine(ReaderModule);
+  _safeWire('gesture engine', () => initGestureEngine(ReaderModule));
 
   // 9. Router
   Router.init();
@@ -110,7 +99,6 @@ async function bootstrap() {
   ToolsModule.wireInputs();
 
   // 11. Splash
-  window._D && window._D('BOOT-14: _hideSplash() calling');
   _hideSplash();
 
   // 12. Android bridge — only active when window.AndroidBridge is injected by WebView
@@ -129,7 +117,6 @@ async function bootstrap() {
   }
 
   bus.emit(EVENTS.APP_READY, {});
-  window._D && window._D('BOOT-16: APP_READY — bootstrap complete, main UI live');
   log.info('Bootstrap complete');
 }
 
@@ -182,47 +169,8 @@ function _registerRoutes() {
   // Camera is a fullscreen modal overlay, not a routed page — no registration needed.
 }
 
-// ── Global event wiring ───────────────────────────────────────────────────────
-function _wireGlobalEvents() {
-
-  // ── Navigation bar ──────────────────────────────────────────────────────
-  document.querySelectorAll('.nav-item[data-page]').forEach(item => {
-    item.addEventListener('click', e => { ripple(e, item); Router.go(item.dataset.page); });
-  });
-  document.getElementById('back-btn')?.addEventListener('click',
-    () => Router.go(State.prevPage || PAGES.HOME));
-
-  // ── Cross-module open requests ──────────────────────────────────────────
-  bus.on(APP_EVENTS.READER_OPEN_REQUEST, ({ fileId })       => ReaderModule.open(fileId));
-  bus.on(APP_EVENTS.EDITOR_OPEN_REQUEST, ({ fileId, tool }) => EditorModule.open(fileId, tool));
-
-  // ── File input / drag-drop ──────────────────────────────────────────────
-  const fileInput = document.getElementById('file-input');
-  fileInput?.addEventListener('change', e => {
-    const files = [...e.target.files];
-    if (files.length) FilesModule.handleFiles(files);
-    e.target.value = '';
-  });
-  document.getElementById('fab')?.addEventListener('click',
-    () => fileInput?.click());
-
-  // Drag-drop on the files page and home page
-  const dropTargets = [
-    document.getElementById('page-files'),
-    document.getElementById('page-home'),
-  ].filter(Boolean);
-  dropTargets.forEach(zone => {
-    zone.addEventListener('dragover',  e => { e.preventDefault(); zone.classList.add('drag-over'); });
-    zone.addEventListener('dragleave', e => { if (!zone.contains(e.relatedTarget)) zone.classList.remove('drag-over'); });
-    zone.addEventListener('drop', e => {
-      e.preventDefault(); zone.classList.remove('drag-over');
-      const files = [...e.dataTransfer.files].filter(f =>
-        f.type === 'application/pdf' || f.name.toLowerCase().endsWith('.pdf')
-      );
-      if (files.length) FilesModule.handleFiles(files);
-    });
-  });
-
+// ── Global search (own function so a failure elsewhere in startup can never skip it) ──
+function _wireSearch() {
   // ── Global search ───────────────────────────────────────────────────────
   const searchBtn   = document.getElementById('search-btn');
   const searchBar   = document.getElementById('search-overlay');
@@ -276,6 +224,60 @@ function _wireGlobalEvents() {
     if (State.page === PAGES.FILES) {
       bus.emit('files:renderFiltered', { files: filtered });
     }
+  });
+}
+
+// ── Home storage card: Manage ─────────────────────────────────────────────────
+// #storage-manage previously had no handler at all, so tapping it did nothing.
+// Managing local storage = reviewing / deleting stored PDFs, which lives on the Files page.
+function _wireManage() {
+  document.getElementById('storage-manage')?.addEventListener('click', () => Router.go(PAGES.FILES));
+}
+
+// Wire one feature; an exception in one must not prevent the rest of the UI from working.
+function _safeWire(name, fn) {
+  try { fn(); } catch (e) { log.error(`Wiring "${name}" failed:`, e); }
+}
+
+// ── Global event wiring ───────────────────────────────────────────────────────
+function _wireGlobalEvents() {
+
+  // ── Navigation bar ──────────────────────────────────────────────────────
+  document.querySelectorAll('.nav-item[data-page]').forEach(item => {
+    item.addEventListener('click', e => { ripple(e, item); Router.go(item.dataset.page); });
+  });
+  document.getElementById('back-btn')?.addEventListener('click',
+    () => Router.go(State.prevPage || PAGES.HOME));
+
+  // ── Cross-module open requests ──────────────────────────────────────────
+  bus.on(APP_EVENTS.READER_OPEN_REQUEST, ({ fileId })       => ReaderModule.open(fileId));
+  bus.on(APP_EVENTS.EDITOR_OPEN_REQUEST, ({ fileId, tool }) => EditorModule.open(fileId, tool));
+
+  // ── File input / drag-drop ──────────────────────────────────────────────
+  const fileInput = document.getElementById('file-input');
+  fileInput?.addEventListener('change', e => {
+    const files = [...e.target.files];
+    if (files.length) FilesModule.handleFiles(files);
+    e.target.value = '';
+  });
+  document.getElementById('fab')?.addEventListener('click',
+    () => fileInput?.click());
+
+  // Drag-drop on the files page and home page
+  const dropTargets = [
+    document.getElementById('page-files'),
+    document.getElementById('page-home'),
+  ].filter(Boolean);
+  dropTargets.forEach(zone => {
+    zone.addEventListener('dragover',  e => { e.preventDefault(); zone.classList.add('drag-over'); });
+    zone.addEventListener('dragleave', e => { if (!zone.contains(e.relatedTarget)) zone.classList.remove('drag-over'); });
+    zone.addEventListener('drop', e => {
+      e.preventDefault(); zone.classList.remove('drag-over');
+      const files = [...e.dataTransfer.files].filter(f =>
+        f.type === 'application/pdf' || f.name.toLowerCase().endsWith('.pdf')
+      );
+      if (files.length) FilesModule.handleFiles(files);
+    });
   });
 
   // ── Modal ────────────────────────────────────────────────────────────────
@@ -368,7 +370,6 @@ function _wireGlobalEvents() {
 
 // ── Splash hide ───────────────────────────────────────────────────────────────
 function _hideSplash() {
-  window._D && window._D('BOOT-15: _hideSplash() entered');
   const splash = document.getElementById('splash');
   const app    = document.getElementById('app');
   if (!splash) return;
@@ -387,9 +388,7 @@ window.onerror = () => _hideSplash();
 window.addEventListener('unhandledrejection', () => _hideSplash());
 
 // ── Service Worker registration ───────────────────────────────────────────────
-// FORENSIC: SW registers unconditionally on Android WebView (no AndroidBridge guard)
-// This means SW cache.addAll(27 files) runs concurrently with page bootstrap
-window._D && window._D('BOOT-SW: serviceWorker check — in nav: '+ ('serviceWorker' in navigator));
+// Service Worker registration (also active inside the Android WebView: caches CDN libs for offline use)
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
     navigator.serviceWorker.register('./sw.js', { scope: './' })

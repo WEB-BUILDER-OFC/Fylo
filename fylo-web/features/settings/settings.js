@@ -144,7 +144,11 @@ export function wireSettingsEvents() {
 
   // Service Worker update notification
   bus.on('sw:updateAvailable', () => {
-    toast('Update available — tap to reload', 6000);
+    // Inside the Android app the web assets ship with the APK, so a service-worker "update"
+    // carries nothing the user needs — and a forced reload would interrupt camera/permission
+    // dialogs and open screens. Only the browser/PWA build self-reloads.
+    if (typeof window.AndroidBridge !== 'undefined') return;
+    toast('Update available — reloading shortly', 6000);
     setTimeout(() => window.location.reload(), 6000);
   });
 }

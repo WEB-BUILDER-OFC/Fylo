@@ -1218,7 +1218,13 @@ function renderToolsCats() {
 //  FILE INPUT WIRING (tool-file-input + image-input)
 // ============================================================
 // These are global inputs; we forward to whichever modal registered a callback.
+// This function is invoked from three places (module load, DOMContentLoaded, app bootstrap).
+// It must only attach listeners once — otherwise every home quick-action button ends up with
+// 3 click handlers and a single tap opens the camera / starts a tool flow three times.
+let _toolInputsWired = false;
 function wireToolInputs() {
+  if (_toolInputsWired) return;
+  _toolInputsWired = true;
   const toolInput  = document.getElementById('tool-file-input');
   const imageInput = document.getElementById('image-input');
 

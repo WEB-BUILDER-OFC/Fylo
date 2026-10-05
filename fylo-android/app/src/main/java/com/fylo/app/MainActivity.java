@@ -4,6 +4,7 @@ import android.Manifest;
 import android.content.ClipData;
 import android.content.ContentResolver;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Bundle;
@@ -74,10 +75,13 @@ public class MainActivity extends AppCompatActivity {
     private static final String ASSET_HOST = "appassets.androidplatform.net";
     private static final String BASE_URL   =
             "https://" + ASSET_HOST + "/assets/www/";
-    private static final int CAMERA_PERMISSION_REQUEST = 1001;
 
     private WebView mWebView;
-    private boolean mNeedSwCheck = true;
+    // One-time (per APK install/update) cleanup of service workers left by an older build.
+    // Previously this ran — and force-reloaded the page — on EVERY launch.
+    private boolean mNeedSwCheck = false;
+    private static final String PREFS = "fylo_native";
+    private static final String PREF_SW_CLEANED = "sw_cleaned_for_install";
     private static int sRendererCrashCount = 0;
 
 
@@ -86,6 +90,17 @@ public class MainActivity extends AppCompatActivity {
 
     // File chooser callback for <input type="file">
     private ValueCallback<Uri[]> mFileChooserCallback;
+
+    // Camera: a WebView getUserMedia() request that is waiting for the Android
+    // runtime CAMERA permission dialog, plus a guard so only one dialog is ever in flight.
+    private PermissionRequest mPendingWebPermission = null;
+    private boolean mCameraPermissionInFlight = false;
+
+    // Native runtime-permission launcher for CAMERA. Result resolves BOTH the pending
+    // WebView request (getUserMedia) and the JS pre-flight callback (fyloOnCameraPermission).
+    private final ActivityResultLauncher<String> mCameraPermissionLauncher =
+        registerForActivityResult(new ActivityResultContracts.RequestPermission(),
+            granted -> onCameraPermissionResult(Boolean.TRUE.equals(granted)));
 
     // File picker launcher
     private final ActivityResultLauncher<String[]> mFilePicker =
@@ -106,6 +121,9 @@ public class MainActivity extends AppCompatActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
+
+        mNeedSwCheck = getSharedPreferences(PREFS, MODE_PRIVATE)
+                .getLong(PREF_SW_CLEANED, -1L) != installStamp();
 
         mWebView = findViewById(R.id.webview);
         setupWebView();
@@ -180,7 +198,6 @@ public class MainActivity extends AppCompatActivity {
                 WebResourceResponse response =
                         assetLoader.shouldInterceptRequest(request.getUrl());
                 if (response != null) {
-                    Log.d(TAG, "AssetLoader served: " + request.getUrl().getPath());
                     // Force text/javascript for all .js files.
                     // AssetsPathHandler delegates to MimeTypeMap, which on some Android
                     // versions does not have .js registered and falls back to text/plain.
@@ -228,20 +245,13 @@ public class MainActivity extends AppCompatActivity {
             }
 
             @Override
-            public void onPageStarted(WebView view, String url, android.graphics.Bitmap fav) {
-                super.onPageStarted(view, url, fav);
-                Log.i(TAG, "JAVA: onPageStarted url=" + url);
-                view.evaluateJavascript("window._D&&window._D('BOOT-JAVA-01: onPageStarted')", null);
-            }
-
-            @Override
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
-                Log.i(TAG, "JAVA: onPageFinished url=" + url);
                 sRendererCrashCount = 0;
-                view.evaluateJavascript("window._D&&window._D('BOOT-JAVA-02: onPageFinished')", null);
                 if (mNeedSwCheck) {
                     mNeedSwCheck = false;
+                    getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                            .putLong(PREF_SW_CLEANED, installStamp()).apply();
                     String swJS = "(function(){if(!('serviceWorker' in navigator))return;"
                         + "navigator.serviceWorker.getRegistrations().then(function(rs){"
                         + "if(!rs.length)return;"
@@ -274,17 +284,14 @@ public class MainActivity extends AppCompatActivity {
                         ((android.app.ActivityManager)getSystemService(ACTIVITY_SERVICE)).getMemoryInfo(m);
                         ram = m.availMem / 1048576;
                     } catch (Exception e3) {}
-                    final String info = "SCREENSHOT THIS!\n\n"
-                        + "didCrash: " + crashed + "\n"
-                        + "crashCount: " + sRendererCrashCount + "\n"
-                        + "Android SDK: " + android.os.Build.VERSION.SDK_INT + "\n"
-                        + "Device: " + android.os.Build.MANUFACTURER + " " + android.os.Build.MODEL + "\n"
-                        + "WebView: " + wv + "\n"
-                        + "Free RAM: " + ram + " MB";
-                    Log.e(TAG, "CRASH DIAG:\n" + info);
+                    Log.e(TAG, "Renderer gone repeatedly: didCrash=" + crashed
+                        + " count=" + sRendererCrashCount
+                        + " sdk=" + android.os.Build.VERSION.SDK_INT
+                        + " device=" + android.os.Build.MANUFACTURER + " " + android.os.Build.MODEL
+                        + " webview=" + wv + " freeRamMb=" + ram);
                     runOnUiThread(() -> new AlertDialog.Builder(MainActivity.this)
-                        .setTitle("FYLO Crash — Screenshot!")
-                        .setMessage(info)
+                        .setTitle("FYLO stopped unexpectedly")
+                        .setMessage("The app's view stopped several times in a row. Tap Retry to reload.")
                         .setPositiveButton("Retry", (d, w) -> { sRendererCrashCount = 0; recreate(); })
                         .setNegativeButton("Close", null)
                         .setCancelable(false).show());
@@ -299,9 +306,16 @@ public class MainActivity extends AppCompatActivity {
         // WebChromeClient — camera permissions and file chooser
         mWebView.setWebChromeClient(new WebChromeClient() {
             @Override
-            public void onPermissionRequest(PermissionRequest request) {
-                // Allow camera access for document scanning
-                request.grant(request.getResources());
+            public void onPermissionRequest(final PermissionRequest request) {
+                // getUserMedia() lands here. WebView permission != Android permission:
+                // the app must also hold the runtime CAMERA permission, otherwise the
+                // grant below is useless and the system dialog never appears.
+                runOnUiThread(() -> handleWebPermissionRequest(request));
+            }
+
+            @Override
+            public void onPermissionRequestCanceled(PermissionRequest request) {
+                if (mPendingWebPermission == request) mPendingWebPermission = null;
             }
 
             @Override
@@ -331,6 +345,81 @@ public class MainActivity extends AppCompatActivity {
         // Enable WebView debugging in debug builds
         if (BuildConfig.DEBUG) {
             WebView.setWebContentsDebuggingEnabled(true);
+        }
+    }
+
+    /** Changes whenever the APK is installed or updated. */
+    private long installStamp() {
+        try {
+            return getPackageManager().getPackageInfo(getPackageName(), 0).lastUpdateTime;
+        } catch (Exception e) {
+            return -1L;
+        }
+    }
+
+    // ── Camera permission ─────────────────────────────────────────────────────
+
+    private boolean hasCameraPermission() {
+        return ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+                == PackageManager.PERMISSION_GRANTED;
+    }
+
+    /** Runs on the UI thread. Grants the WebView request, asking Android for CAMERA first if needed. */
+    private void handleWebPermissionRequest(PermissionRequest request) {
+        Uri origin = request.getOrigin();
+        // Only our own bundled origin may use the camera.
+        if (origin == null || !ASSET_HOST.equals(origin.getHost())) {
+            request.deny();
+            return;
+        }
+        boolean wantsVideo = false;
+        for (String r : request.getResources()) {
+            if (PermissionRequest.RESOURCE_VIDEO_CAPTURE.equals(r)) wantsVideo = true;
+        }
+        if (!wantsVideo) {            // FYLO only ever needs video (getUserMedia audio:false)
+            request.deny();
+            return;
+        }
+        if (hasCameraPermission()) {
+            request.grant(new String[]{PermissionRequest.RESOURCE_VIDEO_CAPTURE});
+            return;
+        }
+        if (mPendingWebPermission != null && mPendingWebPermission != request) {
+            mPendingWebPermission.deny();   // superseded by the newer request
+        }
+        mPendingWebPermission = request;
+        launchCameraPermissionDialog();
+    }
+
+    /** Shows the native "Allow FYLO to take pictures and record video?" dialog (once at a time). */
+    private void launchCameraPermissionDialog() {
+        if (mCameraPermissionInFlight) return;   // result callback will resolve everything waiting
+        mCameraPermissionInFlight = true;
+        try {
+            mCameraPermissionLauncher.launch(Manifest.permission.CAMERA);
+        } catch (Exception e) {
+            Log.e(TAG, "Could not launch camera permission dialog", e);
+            onCameraPermissionResult(false);
+        }
+    }
+
+    /** Result of the native CAMERA dialog. Resolves the pending getUserMedia() and the JS pre-flight. */
+    private void onCameraPermissionResult(boolean granted) {
+        mCameraPermissionInFlight = false;
+        PermissionRequest req = mPendingWebPermission;
+        mPendingWebPermission = null;
+        if (req != null) {
+            try {
+                if (granted) req.grant(new String[]{PermissionRequest.RESOURCE_VIDEO_CAPTURE});
+                else req.deny();
+            } catch (Exception e) {
+                Log.w(TAG, "WebView permission request no longer valid", e);
+            }
+        }
+        if (mWebView != null) {
+            mWebView.evaluateJavascript(
+                "window.fyloOnCameraPermission && window.fyloOnCameraPermission(" + granted + ")",
+                null);
         }
     }
 
@@ -436,22 +525,6 @@ public class MainActivity extends AppCompatActivity {
                 }
             }
         );
-    }
-
-    // ── Camera permission ─────────────────────────────────────────────────────
-
-    @Override
-    public void onRequestPermissionsResult(int requestCode,
-            @NonNull String[] permissions, @NonNull int[] grantResults) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
-        if (requestCode == CAMERA_PERMISSION_REQUEST) {
-            boolean granted = grantResults.length > 0
-                && grantResults[0] == PackageManager.PERMISSION_GRANTED;
-            mWebView.evaluateJavascript(
-                "window.fyloOnCameraPermission && window.fyloOnCameraPermission(" + granted + ")",
-                null
-            );
-        }
     }
 
     // ── JavaScript Bridge ─────────────────────────────────────────────────────
@@ -570,17 +643,16 @@ public class MainActivity extends AppCompatActivity {
          */
         @JavascriptInterface
         public void requestCameraPermission() {
-            if (ContextCompat.checkSelfPermission(MainActivity.this,
-                    Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
-                mWebView.post(() ->
+            // Bridge methods run on a WebView background thread; dialogs must start on the UI thread.
+            runOnUiThread(() -> {
+                if (hasCameraPermission()) {
                     mWebView.evaluateJavascript(
                         "window.fyloOnCameraPermission && window.fyloOnCameraPermission(true)",
-                        null));
-            } else {
-                requestPermissions(
-                    new String[]{Manifest.permission.CAMERA},
-                    CAMERA_PERMISSION_REQUEST);
-            }
+                        null);
+                } else {
+                    launchCameraPermissionDialog();
+                }
+            });
         }
 
         /**
@@ -588,8 +660,7 @@ public class MainActivity extends AppCompatActivity {
          */
         @JavascriptInterface
         public boolean hasCameraPermission() {
-            return ContextCompat.checkSelfPermission(MainActivity.this,
-                Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED;
+            return MainActivity.this.hasCameraPermission();
         }
 
         /**

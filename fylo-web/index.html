@@ -16,8 +16,6 @@
   <link rel="stylesheet" href="assets/css/main.css">
 </head>
 <body>
-<!-- FORENSIC DIAGNOSTIC — remove after root cause found -->
-<div id="_fylo_diag" style="pointer-events:none;position:fixed;bottom:0;left:0;right:0;max-height:160px;overflow-y:auto;background:rgba(0,0,0,0.92);color:#00ff88;font-family:monospace;font-size:10px;line-height:1.4;padding:6px;z-index:2147483647;border-top:1px solid #00ff88;word-break:break-all"></div>
 <!-- Splash Screen -->
 <div id="splash" class="splash-screen">
   <div class="splash-content">
@@ -362,55 +360,6 @@
     Works on GitHub Pages, Netlify, Vercel, any HTTP server.
     Does NOT work with file:// — use bundle.html for that.
   -->
-  <!--
-    Splash failsafe — classic (non-module) script; executes unconditionally.
-    If the ES module bootstrap completes first, _hideSplash() already sets
-    display:none on #splash, so this timeout is a no-op.
-    If modules fail to load or bootstrap hangs, this ensures the UI is
-    always reachable within 10 s — prevents a permanently-frozen splash.
-  -->
-  <script>
-    // ── FORENSIC INSTRUMENTATION — BOOT checkpoints ───────────────────────
-    // Each line written to the overlay stays visible even after renderer crash.
-    // Whatever checkpoint is LAST visible = where startup stopped.
-    (function() {
-      var d = document.getElementById('_fylo_diag');
-      var t0 = Date.now();
-      function _D(msg) {
-        var el = document.getElementById('_fylo_diag');
-        if (!el) return;
-        var ms = Date.now() - t0;
-        el.innerHTML += '[' + ms + 'ms] ' + msg + '<br>';
-        el.scrollTop = el.scrollHeight;
-      }
-      window._D = _D;
-
-      _D('BOOT-01: Classic JS running');
-
-      // Capture ALL JavaScript errors
-      window.onerror = function(msg, src, line) {
-        _D('JS-ERROR: ' + msg + ' @' + (src||'?').split('/').pop() + ':' + line);
-        return false;
-      };
-      window.addEventListener('unhandledrejection', function(e) {
-        _D('REJECTION: ' + (e.reason && e.reason.message ? e.reason.message : String(e.reason)));
-      });
-
-      _D('BOOT-02: Error handlers set');
-
-      // 3-second failsafe (replaces 10s — if this fires it means modules never completed)
-      setTimeout(function() {
-        _D('BOOT-FAILSAFE-3S: Modules did not complete in 3s — trying to show app');
-        var s = document.getElementById('splash');
-        var a = document.getElementById('app');
-        if (s) { s.style.opacity='0'; setTimeout(function(){ s.style.display='none'; }, 400); }
-        if (a) { a.classList.remove('hidden'); a.style.opacity='1'; a.classList.add('show'); }
-      }, 3000);
-
-      _D('BOOT-03: 3s failsafe queued');
-    })();
-  </script>
-
   <script type="module" src="app.js"></script>
 </body>
 </html>

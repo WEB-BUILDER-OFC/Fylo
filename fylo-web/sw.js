@@ -4,9 +4,9 @@
  * Cache-first for app files. Network-first for CDN.
  */
 
-// v4: bumped so activate() purges the 'fylo-v3' app shell, which contains the pre-fix
-// app.js/router.js (APP_NAV recursion). Bump again whenever shipped JS changes.
-const CACHE_NAME = 'fylo-v4';
+// Bump whenever shipped JS/HTML changes so activate() purges the previous app shell.
+// v4 purged the pre-router-fix shell; v5 ships the camera/permission, Manage and debug-overlay-removal changes.
+const CACHE_NAME = 'fylo-v5';
 
 const STATIC_ASSETS = [
   './',
@@ -53,14 +53,20 @@ self.addEventListener('install', e => {
 });
 
 self.addEventListener('activate', e => {
+  let replacedOlderVersion = false;
   e.waitUntil(
     caches.keys()
-      .then(keys => Promise.all(
-        keys.filter(k => k !== CACHE_NAME).map(k => caches.delete(k))
-      ))
+      .then(keys => {
+        const stale = keys.filter(k => k !== CACHE_NAME);
+        replacedOlderVersion = stale.length > 0;
+        return Promise.all(stale.map(k => caches.delete(k)));
+      })
       .then(() => self.clients.claim())
       .then(() => {
-        // Notify all open clients that an update was applied
+        // Tell open pages about an update ONLY if this activation replaced an older version.
+        // A first-ever install is not an "update"; announcing it made the app reload itself
+        // ~6 s after launch, wiping whatever the user was doing (camera, search, dialogs).
+        if (!replacedOlderVersion) return;
         return self.clients.matchAll({ type: 'window' }).then(clients => {
           clients.forEach(client => client.postMessage({ type: 'SW_UPDATED' }));
         });
