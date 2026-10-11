@@ -1,19 +1,23 @@
 /**
- * FYLO Feature — Camera / Document Scanner  (Phase 3 rewrite)
+ * FYLO Feature — Camera / Document Scanner
  *
- * Owns: camera stream lifecycle, multi-page capture, scan-to-PDF pipeline.
- * State is module-local. Cross-module: emits files:incoming when scan completes.
+ * Owns: camera stream lifecycle, multi-page capture, review (reorder/delete), scan-to-PDF pipeline.
+ * State is module-local. Cross-module: emits files:incoming (stores the PDF in FYLO Files) and
+ * reader:openRequest (opens it) when a scan is finished.
  *
- * Architecture:
- *   - Camera is a fullscreen modal overlay (NOT a routed page).
- *   - State lives in _cs (camera session), reset on every open().
- *   - Pages accumulate in _cs.pages[] as {dataUrl, blob} until Save PDF.
- *   - PDF is generated with PDF-Lib and imported into FileStorage via bus.
+ * Scan workflow
+ *   live viewfinder --shutter--> confirm (Retake | Keep) --Keep--> live viewfinder (page added)
+ *   live viewfinder: thumbnails strip + "Pages" (review) + "Create PDF" as soon as 1 page exists
+ *   review: reorder (◀ ▶), delete, "+ Add Page" (back to camera), "Create PDF"
+ *   Create PDF: pdf-lib -> File -> Files storage -> Reader.   Close / Back with pages asks first
+ *   (Create PDF / Keep scanning / Discard) so captured pages are never dropped by accident.
+ *
+ * Camera is a fullscreen modal overlay (NOT a routed page).
  */
 
 import { bus }           from '../../core/eventBus.js';
 import { Libs }          from '../../core/libs.js';
-import { toast, downloadBlob } from '../../core/ui.js';
+import { toast }         from '../../core/ui.js';
 import { createLogger }  from '../../core/logger.js';
 import { isAndroid, androidRequestCamera } from '../../core/android-bridge.js';
 
@@ -22,33 +26,47 @@ const log = createLogger('Camera');
 // ── DOM accessors (lazy — safe to call after DOMContentLoaded) ────────────────
 const D = {
   modal:      () => document.getElementById('camera-modal'),
-  header:     () => document.getElementById('camera-title'),
-  preview:    () => document.getElementById('camera-preview'),
   video:      () => document.getElementById('camera-video'),
   photo:      () => document.getElementById('camera-photo'),
   errorBox:   () => document.getElementById('camera-error'),
   errorMsg:   () => document.getElementById('camera-error-msg'),
   retryBtn:   () => document.getElementById('camera-retry-btn'),
   shutter:    () => document.getElementById('camera-shutter'),
-  addPage:    () => document.getElementById('camera-add-page'),
+  retake:     () => document.getElementById('camera-retake'),
+  reviewBtn:  () => document.getElementById('camera-review-btn'),
   savePdf:    () => document.getElementById('camera-save-pdf'),
   closeBtn:   () => document.getElementById('camera-close'),
   flipBtn:    () => document.getElementById('camera-flip'),
   pagesBar:   () => document.getElementById('camera-pages-bar'),
   pagesList:  () => document.getElementById('camera-pages-list'),
   pagesCount: () => document.getElementById('camera-pages-count'),
+  review:     () => document.getElementById('camera-review'),
+  reviewGrid: () => document.getElementById('camera-review-grid'),
+  reviewTitle:() => document.getElementById('camera-review-title'),
+  reviewBack: () => document.getElementById('camera-review-back'),
+  reviewAdd:  () => document.getElementById('camera-review-add'),
+  reviewSave: () => document.getElementById('camera-review-save'),
+  exit:       () => document.getElementById('camera-exit'),
+  exitMsg:    () => document.getElementById('camera-exit-msg'),
+  exitSave:   () => document.getElementById('camera-exit-save'),
+  exitKeep:   () => document.getElementById('camera-exit-continue'),
+  exitDiscard:() => document.getElementById('camera-exit-discard'),
 };
 
 // ── Session state ─────────────────────────────────────────────────────────────
 const _cs = {
   stream:      null,   // MediaStream
   facingMode:  'environment',
-  pages:       [],     // [{dataUrl:string, objectUrl:string}]
-  capturedUrl: null,   // dataUrl of just-taken shot (not yet confirmed)
+  pages:       [],     // [{dataUrl:string}]  — in final PDF order
+  capturedUrl: null,   // dataUrl of just-taken shot (not yet kept)
   rAF:         null,
-  busy:        false,
+  busy:        false,  // PDF is being created
   starting:    false,  // a camera start/switch is in flight
+  closeTimer:  null,
 };
+
+const _plural = n => n + ' page' + (n !== 1 ? 's' : '');
+const _isOpen = () => !!D.modal() && !D.modal().classList.contains('hidden');
 
 // ── UI state helpers ──────────────────────────────────────────────────────────
 function _showViewfinder() {
@@ -75,92 +93,113 @@ function _showError(msg) {
   _setShutterMode('hidden');
 }
 
+/**
+ * One place decides which controls are visible, from (mode, number of kept pages):
+ *   capture : shutter | "Pages" + "Create PDF" once >=1 page is kept
+ *   confirm : shutter becomes the green Keep tick | "Retake"
+ *   hidden  : (camera error) no shutter, but "Pages"/"Create PDF" stay available for already-kept pages
+ */
 function _setShutterMode(mode) {
-  // mode: 'capture' | 'confirm' | 'hidden'
-  const shutter  = D.shutter();
-  const addPage  = D.addPage();
-  const savePdf  = D.savePdf();
+  const shutter = D.shutter();
   if (!shutter) return;
+  const n = _cs.pages.length;
+  const show = (el, on) => el && el.classList.toggle('hidden', !on);
 
-  if (mode === 'capture') {
+  shutter.dataset.action = mode;
+  if (mode === 'confirm') {
     shutter.classList.remove('hidden');
-    shutter.dataset.action = 'capture';
-    shutter.setAttribute('aria-label', 'Capture');
-    shutter.style.background = '';
-    if (addPage)  addPage.style.visibility  = _cs.pages.length > 0 ? 'visible' : 'hidden';
-    if (savePdf)  savePdf.classList.add('hidden');
-  } else if (mode === 'confirm') {
-    shutter.classList.remove('hidden');
-    shutter.dataset.action = 'confirm';
-    shutter.setAttribute('aria-label', 'Confirm — add this page');
+    shutter.setAttribute('aria-label', 'Keep this page');
     shutter.style.background = 'var(--success, #22c55e)';
-    if (addPage)  addPage.style.visibility  = 'hidden';
-    if (savePdf)  savePdf.classList.add('hidden');
+  } else if (mode === 'capture') {
+    shutter.classList.remove('hidden');
+    shutter.setAttribute('aria-label', n ? 'Add page' : 'Capture');
+    shutter.style.background = '';
   } else {
     shutter.classList.add('hidden');
-    if (addPage)  addPage.style.visibility  = 'hidden';
-    if (savePdf)  savePdf.classList.add('hidden');
   }
+  show(D.retake(),    mode === 'confirm');
+  show(D.reviewBtn(), mode !== 'confirm' && n > 0);
+  show(D.savePdf(),   mode !== 'confirm' && n > 0);
+  if (D.reviewBtn()) D.reviewBtn().textContent = 'Pages (' + n + ')';
 }
+
+function _currentMode() { return D.shutter()?.dataset.action || 'capture'; }
 
 function _updatePagesBar() {
   const n    = _cs.pages.length;
   const bar  = D.pagesBar();
   const list = D.pagesList();
   const cnt  = D.pagesCount();
-
-  if (!bar) return;
-  if (n === 0) { bar.classList.add('hidden'); return; }
-  bar.classList.remove('hidden');
-  if (cnt) cnt.textContent = n + ' page' + (n !== 1 ? 's' : '');
-
-  if (list) {
-    list.innerHTML = '';
-    _cs.pages.forEach((pg, i) => {
-      const item = document.createElement('div');
-      item.className = 'camera-page-thumb';
-      item.title = `Page ${i + 1}`;
-      const img = document.createElement('img');
-      img.src = pg.dataUrl;
-      img.alt = `Page ${i + 1}`;
-
-      const num = document.createElement('span');
-      num.className = 'camera-page-num';
-      num.textContent = i + 1;
-
-      const del = document.createElement('button');
-      del.className = 'camera-page-del';
-      del.title = 'Remove page';
-      del.innerHTML = '✕';
-      del.addEventListener('click', e => {
-        e.stopPropagation();
-        _removePage(i);
+  if (bar) {
+    bar.classList.toggle('hidden', n === 0);
+    if (cnt) cnt.textContent = _plural(n);
+    if (list) {
+      list.innerHTML = '';
+      _cs.pages.forEach((pg, i) => {
+        const item = document.createElement('div');
+        item.className = 'camera-page-thumb';
+        item.title = `Page ${i + 1} — tap to review`;
+        const img = document.createElement('img');
+        img.src = pg.dataUrl; img.alt = `Page ${i + 1}`;
+        const num = document.createElement('span');
+        num.className = 'camera-page-num'; num.textContent = i + 1;
+        item.append(img, num);
+        item.addEventListener('click', () => _openReview());
+        list.appendChild(item);
       });
-
-      item.appendChild(img);
-      item.appendChild(num);
-      item.appendChild(del);
-      list.appendChild(item);
-    });
-    // Scroll to latest
-    list.scrollLeft = list.scrollWidth;
+      list.scrollLeft = list.scrollWidth;       // newest page in view
+    }
   }
+  _setShutterMode(_currentMode());              // Pages / Create PDF visibility follows the page count
+  if (!D.review()?.classList.contains('hidden')) _renderReview();
+}
 
-  // Show save button once we have at least 1 confirmed page
-  D.savePdf()?.classList.toggle('hidden', n === 0);
-  // Show addPage once we have pages and are in viewfinder mode
-  if (D.shutter()?.dataset.action === 'capture') {
-    const ap = D.addPage();
-    if (ap) ap.style.visibility = n > 0 ? 'visible' : 'hidden';
-  }
+// ── Review: reorder / delete ──────────────────────────────────────────────────
+function _openReview() {
+  if (!_cs.pages.length || _cs.busy) return;
+  D.review()?.classList.remove('hidden');
+  _renderReview();
+}
+function _closeReview() { D.review()?.classList.add('hidden'); }
+
+function _renderReview() {
+  const grid = D.reviewGrid();
+  const n = _cs.pages.length;
+  if (D.reviewTitle()) D.reviewTitle().textContent = n ? _plural(n) : 'No pages';
+  if (!grid) return;
+  grid.innerHTML = '';
+  _cs.pages.forEach((pg, i) => {
+    const card = document.createElement('div');
+    card.className = 'camera-review-card';
+    card.innerHTML =
+      '<div class="thumb"><img alt=""><span class="num"></span></div>' +
+      '<div class="camera-review-actions">' +
+      '<button type="button" class="left"  aria-label="Move page earlier">&#9664;</button>' +
+      '<button type="button" class="del"   aria-label="Delete page">&#10005;</button>' +
+      '<button type="button" class="right" aria-label="Move page later">&#9654;</button></div>';
+    card.querySelector('img').src = pg.dataUrl;
+    card.querySelector('img').alt = `Page ${i + 1}`;
+    card.querySelector('.num').textContent = i + 1;
+    const left = card.querySelector('.left'), right = card.querySelector('.right');
+    left.disabled = i === 0; right.disabled = i === n - 1;
+    left.addEventListener('click',  () => _movePage(i, i - 1));
+    right.addEventListener('click', () => _movePage(i, i + 1));
+    card.querySelector('.del').addEventListener('click', () => _removePage(i));
+    grid.appendChild(card);
+  });
+}
+
+function _movePage(from, to) {
+  if (to < 0 || to >= _cs.pages.length || from === to) return;
+  const [pg] = _cs.pages.splice(from, 1);
+  _cs.pages.splice(to, 0, pg);
+  _updatePagesBar();
 }
 
 function _removePage(idx) {
   _cs.pages.splice(idx, 1);
   _updatePagesBar();
-  if (_cs.pages.length === 0) {
-    D.savePdf()?.classList.add('hidden');
-  }
+  if (_cs.pages.length === 0) _closeReview();   // nothing left to review: back to the camera
   toast('Page removed');
 }
 
@@ -347,17 +386,18 @@ function _captureFrame() {
   canvas.width = sw; canvas.height = sh;
   canvas.getContext('2d').drawImage(video, 0, 0, sw, sh);
   const dataUrl = canvas.toDataURL('image/jpeg', 0.88);
+  canvas.width = canvas.height = 0;
   _cs.capturedUrl = dataUrl;
   _showPreview(dataUrl);
 }
 
-function _confirmPage() {
+function _keepPage() {
   if (!_cs.capturedUrl) return;
   _cs.pages.push({ dataUrl: _cs.capturedUrl });
   _cs.capturedUrl = null;
-  _updatePagesBar();
-  _showViewfinder();
-  if (_cs.pages.length === 1) toast('Page 1 added — keep scanning or Save PDF');
+  _showViewfinder();            // first: mode -> capture ...
+  _updatePagesBar();            // ... then page count (the order matters: this used to hide "Save PDF")
+  toast(`Page ${_cs.pages.length} added`);
 }
 
 function _retake() {
@@ -365,63 +405,112 @@ function _retake() {
   _showViewfinder();
 }
 
-// ── Save as PDF ───────────────────────────────────────────────────────────────
-async function _saveAsPdf() {
-  if (_cs.pages.length === 0) { toast('No pages captured'); return; }
-  if (_cs.busy) return;
-  _cs.busy = true;
-  const btn = D.savePdf();
-  if (btn) { btn.disabled = true; btn.textContent = 'Saving…'; }
-  toast(`Creating PDF from ${_cs.pages.length} page${_cs.pages.length !== 1 ? 's' : ''}…`);
+// ── Create PDF ────────────────────────────────────────────────────────────────
+function _dataUrlToBytes(dataUrl) {
+  const bin = atob(dataUrl.slice(dataUrl.indexOf(',') + 1));
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
 
-  try {
-    if (!await Libs.waitForPdfLib()) {
-      toast('PDF-Lib not loaded. Check your connection.'); return;
-    }
-    const { PDFDocument } = Libs.pdflib;
-    const pdf = await PDFDocument.create();
+function _scanFileName() {
+  const d = new Date(), p = n => String(n).padStart(2, '0');
+  return `Scan ${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ` +
+         `${p(d.getHours())}.${p(d.getMinutes())}.${p(d.getSeconds())}.pdf`;
+}
 
-    for (const pg of _cs.pages) {
-      // dataUrl → ArrayBuffer
-      const resp  = await fetch(pg.dataUrl);
-      const ab    = await resp.arrayBuffer();
-      let img;
-      try {
-        img = await pdf.embedJpg(ab);
-      } catch(e) {
-        try { img = await pdf.embedPng(ab); } catch(e2) {
-          log.warn('Could not embed page image:', e2); continue;
-        }
-      }
-      const page = pdf.addPage([img.width, img.height]);
-      page.drawImage(img, { x: 0, y: 0, width: img.width, height: img.height });
-    }
+function _setBusy(on, label) {
+  _cs.busy = on;
+  [D.savePdf(), D.reviewSave(), D.exitSave()].forEach(b => {
+    if (!b) return;
+    if (!b.dataset.label) b.dataset.label = b.textContent;
+    b.disabled = on;
+    b.textContent = on ? (label || 'Creating…') : b.dataset.label;
+  });
+  [D.shutter(), D.reviewBtn(), D.reviewAdd(), D.flipBtn()].forEach(b => { if (b) b.disabled = on; });
+}
 
-    if (pdf.getPageCount() === 0) {
-      toast('No pages could be embedded — PDF not saved.'); return;
-    }
-
-    const bytes = await pdf.save();
-    const blob  = new Blob([bytes], { type: 'application/pdf' });
-    const name  = 'scan_' + new Date().toISOString().slice(0, 10) +
-                  '_' + _cs.pages.length + 'p.pdf';
-    downloadBlob(blob, name);
-    const file = new File([blob], name, { type: 'application/pdf' });
-    bus.emit('files:incoming', { files: [file] });
-    toast(`Saved ${pdf.getPageCount()}-page PDF`);
-    _closeCamera();
-  } catch(e) {
-    log.error('Scan-to-PDF failed:', e);
-    toast('Failed to create PDF: ' + e.message);
-  } finally {
-    _cs.busy = false;
-    if (btn) { btn.disabled = false; btn.textContent = 'Save PDF'; }
+/** Build the PDF from the kept pages (in order). Throws on failure; pages are never touched. */
+async function _buildPdf() {
+  if (!await Libs.waitForPdfLib()) throw new Error('PDF library not loaded');
+  const { PDFDocument } = Libs.pdflib;
+  const pdf = await PDFDocument.create();
+  for (const pg of _cs.pages) {
+    const bytes = _dataUrlToBytes(pg.dataUrl);
+    let img;
+    try { img = await pdf.embedJpg(bytes); }
+    catch (e) { img = await pdf.embedPng(bytes); }
+    // A4-sized page that follows the photo's orientation; the image fills it exactly (no distortion).
+    const A4_SHORT = 595.28, A4_LONG = 841.89;
+    const landscape = img.width > img.height;
+    const w = landscape ? A4_LONG : A4_SHORT;
+    const h = w * img.height / img.width;
+    pdf.addPage([w, h]).drawImage(img, { x: 0, y: 0, width: w, height: h });
   }
+  return pdf.save();
+}
+
+/** Hand the PDF to the Files module and wait until it is stored. Resolves to the new file id. */
+function _storeInFiles(file) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error('Saving timed out')), 20000);
+    bus.emit('files:incoming', {
+      files: [file],
+      requirePersist: true,        // a scan must really be stored, otherwise keep the pages and let the user retry
+      onSaved: ids => { clearTimeout(t); ids && ids.length ? resolve(ids[0]) : reject(new Error('Could not save to Files')); },
+    });
+  });
+}
+
+async function _createPdf() {
+  if (_cs.busy) return;
+  if (!_cs.pages.length) { toast('Capture at least one page first'); return; }
+  _hideExitDialog();
+  _setBusy(true);
+  try {
+    const bytes = await _buildPdf();
+    const file  = new File([bytes], _scanFileName(), { type: 'application/pdf' });
+    const fileId = await _storeInFiles(file);
+    const count = _cs.pages.length;
+    _cs.pages = [];                       // only now, after it is safely stored, is the draft released
+    _setBusy(false);
+    _closeCamera();
+    toast(`Saved ${_plural(count)} to Files`);
+    bus.emit('reader:openRequest', { fileId });
+  } catch (e) {
+    log.error('Scan-to-PDF failed:', e);
+    _setBusy(false);
+    toast('Could not create PDF: ' + (e && e.message ? e.message : 'unknown error') + ' — your pages are still here');
+  }
+}
+
+// ── Leave / back (never drops pages silently) ─────────────────────────────────
+function _showExitDialog() {
+  const n = _cs.pages.length + (_cs.capturedUrl ? 1 : 0);
+  if (D.exitMsg()) D.exitMsg().textContent =
+    `You have ${_plural(n)} that ${n === 1 ? "hasn't" : "haven't"} been saved. Create the PDF now, keep scanning, or discard them.`;
+  if (D.exitSave()) D.exitSave().classList.toggle('hidden', _cs.pages.length === 0);
+  D.exit()?.classList.remove('hidden');
+}
+function _hideExitDialog() { D.exit()?.classList.add('hidden'); }
+
+/**
+ * User asked to leave (X button, swipe, Android Back). Back-navigation peels one layer at a time:
+ * exit dialog -> review panel -> confirm preview -> (unsaved pages? ask) -> close.
+ */
+function _requestClose() {
+  if (!_isOpen() || _cs.busy) return;
+  if (!D.exit()?.classList.contains('hidden')) { _hideExitDialog(); return; }       // Back = "Keep scanning"
+  if (!D.review()?.classList.contains('hidden')) { _closeReview(); return; }
+  if (_currentMode() === 'confirm' && !_cs.pages.length) { _retake(); return; }
+  if (_cs.pages.length || _cs.capturedUrl) { _showExitDialog(); return; }
+  _closeCamera();
 }
 
 // ── Open / close ─────────────────────────────────────────────────────────────
 function _openCamera() {
-  // Reset session
+  clearTimeout(_cs.closeTimer);
+  // Fresh session (a draft can only exist here if close was interrupted; never resurrect stale shots)
   _cs.pages       = [];
   _cs.capturedUrl = null;
   _cs.busy        = false;
@@ -430,70 +519,78 @@ function _openCamera() {
   const modal = D.modal();
   if (!modal) { log.error('camera-modal not found in DOM'); return; }
 
+  _closeReview(); _hideExitDialog();
+  _setBusy(false);
   modal.classList.remove('hidden');
-  // Trigger CSS transition
-  _cs.rAF = requestAnimationFrame(() => {
+  _cs.rAF = requestAnimationFrame(() => {   // trigger CSS transition
     _cs.rAF = null;
     modal.classList.add('show');
   });
 
+  _wireButtons();
+  _showViewfinder();
   _updatePagesBar();
   _startStream();
-  _wireButtons();
 }
 
+/** Unconditional close: stops the camera and releases the session. Use _requestClose for user exits. */
 function _closeCamera() {
   _startGen++;          // cancel any start still waiting on permission / hardware
   _cs.starting = false;
   _stopStream();
   _cs.pages       = [];
   _cs.capturedUrl = null;
-  _cs.busy        = false;
+  _closeReview(); _hideExitDialog();
 
   const modal = D.modal();
   if (!modal) return;
   modal.classList.remove('show');
-  setTimeout(() => modal.classList.add('hidden'), 300);
+  clearTimeout(_cs.closeTimer);
+  _cs.closeTimer = setTimeout(() => modal.classList.add('hidden'), 300);
   if (_cs.rAF) { cancelAnimationFrame(_cs.rAF); _cs.rAF = null; }
 }
 
-// ── Button wiring (called on every open) ─────────────────────────────────────
+// ── Button wiring (idempotent) ────────────────────────────────────────────────
 let _buttonsWired = false;
 function _wireButtons() {
   if (_buttonsWired) return;
   _buttonsWired = true;
 
-  D.closeBtn()?.addEventListener('click', () => _closeCamera());
+  D.closeBtn()?.addEventListener('click', () => _requestClose());
   D.flipBtn()?.addEventListener('click',  () => _flipCamera());
   D.retryBtn()?.addEventListener('click', () => _startStream());
 
-  // Shutter is dual-mode: capture or confirm
+  // Shutter is dual-mode: capture, or "keep" while a fresh shot is being confirmed
   D.shutter()?.addEventListener('click', () => {
-    const action = D.shutter()?.dataset.action || 'capture';
-    if (action === 'capture') _captureFrame();
-    else if (action === 'confirm') _confirmPage();
+    if (_cs.busy) return;
+    if (_currentMode() === 'confirm') _keepPage(); else if (_currentMode() === 'capture') _captureFrame();
   });
+  D.retake()?.addEventListener('click', () => _retake());
+  D.reviewBtn()?.addEventListener('click', () => _openReview());
+  D.pagesCount()?.addEventListener('click', () => _openReview());
+  D.savePdf()?.addEventListener('click', () => _createPdf());
 
-  // Retake from confirm state — re-show viewfinder
-  D.addPage()?.addEventListener('click', () => {
-    // Already in viewfinder — this just signals intent (no-op visually)
-    // Useful if user is on confirm screen and wants to discard
-    _retake();
-  });
+  D.reviewBack()?.addEventListener('click', () => _closeReview());
+  D.reviewAdd()?.addEventListener('click',  () => _closeReview());      // "+ Add Page" = back to the camera
+  D.reviewSave()?.addEventListener('click', () => _createPdf());
 
-  D.savePdf()?.addEventListener('click', () => _saveAsPdf());
+  D.exitSave()?.addEventListener('click',    () => _createPdf());
+  D.exitKeep()?.addEventListener('click',    () => _hideExitDialog());
+  D.exitDiscard()?.addEventListener('click', () => { _cs.pages = []; _cs.capturedUrl = null; _closeCamera(); });
 
-  // Swipe right to close on mobile
-  let touchStartX = 0;
-  D.modal()?.addEventListener('touchstart', e => { touchStartX = e.touches[0].clientX; }, { passive: true });
+  // Swipe right to leave (goes through the same safe-exit path)
+  let touchStartX = 0, touchStartY = 0;
+  D.modal()?.addEventListener('touchstart', e => { touchStartX = e.touches[0].clientX; touchStartY = e.touches[0].clientY; }, { passive: true });
   D.modal()?.addEventListener('touchend', e => {
-    const dx = e.changedTouches[0].clientX - touchStartX;
-    if (dx > 80) _closeCamera(); // swipe right → close
+    if (e.target.closest?.('.camera-pages-list, .camera-review-grid')) return;   // those scroll horizontally/vertically
+    const dx = e.changedTouches[0].clientX - touchStartX, dy = e.changedTouches[0].clientY - touchStartY;
+    if (dx > 120 && Math.abs(dy) < 60) _requestClose();
   }, { passive: true });
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
 export const CameraModule = {
   open:  () => _openCamera(),
-  close: () => _closeCamera(),
+  close: () => _requestClose(),                 // user-initiated (Android Back etc.): asks before dropping pages
+  get pageCount() { return _cs.pages.length; },
 };

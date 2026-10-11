@@ -39,9 +39,12 @@ function timeAgo(ts) {
 }
 
 // ── File ingestion ────────────────────────────────────────────────────────────
-async function handleFiles(files) {
-  if (!files || !files.length) return;
-  let addedCount = 0, updatedCount = 0;
+// Returns the ids of the files that are now in the library AND stored in IndexedDB (so callers such as the
+// scanner can open the result, and know it persisted).
+async function handleFiles(files, opts = {}) {
+  const savedIds = [];
+  if (!files || !files.length) return savedIds;
+  let addedCount = 0, updatedCount = 0, notPersisted = 0;
   for (const file of Array.from(files)) {
     if (file.type !== 'application/pdf' && !file.name.endsWith('.pdf')) {
       toast('Only PDF files supported'); continue;
@@ -56,8 +59,9 @@ async function handleFiles(files) {
         blob: file,
         offline: true,
       });
-      try { await FileStorage.save(State.getFile(existing.id)); } catch(e) {}
-      try { await generateThumb(State.getFile(existing.id)); }  catch(e) {}
+      try { await FileStorage.save(State.getFile(existing.id)); savedIds.push(existing.id); }
+      catch(e) { notPersisted++; log.warn('Could not persist file:', e); }
+      generateThumb(State.getFile(existing.id)).catch(() => {});   // not awaited: callers must not wait for the preview
       updatedCount++;
     } else {
       const f = {
@@ -67,8 +71,13 @@ async function handleFiles(files) {
       };
       Actions.addFile(f);
       if (State.files.length > 100) Actions.setFiles(State.files.slice(0,100));
-      try { await FileStorage.save(f); } catch(e) {}
-      try { await generateThumb(f); }    catch(e) {}
+      try { await FileStorage.save(f); savedIds.push(f.id); }
+      catch(e) {
+        log.warn('Could not persist file:', e);
+        if (opts.requirePersist) { Actions.removeFile(f.id); continue; }   // caller (scanner) keeps its pages and retries
+        notPersisted++;
+      }
+      generateThumb(f).catch(() => {});                    // not awaited: callers must not wait for the preview
       addedCount++;
     }
   }
@@ -76,6 +85,8 @@ async function handleFiles(files) {
   if (addedCount > 0 && updatedCount > 0) toast(`${addedCount} added, ${updatedCount} updated`);
   else if (addedCount > 0) toast(`${addedCount} PDF${addedCount > 1 ? 's' : ''} added`);
   else if (updatedCount > 0) toast(`${updatedCount} file${updatedCount > 1 ? 's' : ''} updated`);
+  if (notPersisted > 0) toast('Storage is unavailable — file kept for this session only');
+  return savedIds;
 }
 
 // ── Thumbnail generation ─────────────────────────────────────────────────────
@@ -83,7 +94,9 @@ async function generateThumb(file) {
   if (!file || !file.blob || file.thumbnail) return;
   if (!await Libs.waitForPdfJs()) return;
   try {
-    const ab  = await file.blob.slice(0, 1024 * 1024).arrayBuffer();
+    // A PDF's xref/trailer is at the END of the file, so a truncated slice cannot be parsed. Image-heavy
+    // PDFs (scans) are routinely > 1 MB, which left them without a thumbnail. Read whole files up to 40 MB.
+    const ab  = await (file.blob.size <= 40 * 1024 * 1024 ? file.blob : file.blob.slice(0, 1024 * 1024)).arrayBuffer();
     const pdf  = await Libs.pdfjs.getDocument({ data: ab }).promise;
     const page = await pdf.getPage(1);
     const vp   = page.getViewport({ scale: 0.3 });
@@ -254,7 +267,9 @@ export const FilesModule = {
 };
 
 // ── Bus listeners ─────────────────────────────────────────────────────────────
-bus.on('files:incoming',      ({ files })           => handleFiles(files));
+bus.on('files:incoming',      ({ files, onSaved, requirePersist })  => {
+  handleFiles(files, { requirePersist }).then(ids => onSaved?.(ids)).catch(e => { log.error('files:incoming failed:', e); onSaved?.([]); });
+});
 bus.on('files:render',        ()                    => renderFiles());
 bus.on('files:renderFiltered',({ files })           => renderFiles(files));
 bus.on('files:updateStorage', ()                    => updateStorage());

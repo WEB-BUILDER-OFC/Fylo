@@ -5,8 +5,8 @@
  */
 
 // Bump whenever shipped JS/HTML changes so activate() purges the previous app shell.
-// v4 purged the pre-router-fix shell; v5 ships the camera/permission, Manage and debug-overlay-removal changes.
-const CACHE_NAME = 'fylo-v5';
+// v4 purged the pre-router-fix shell; v6 ships the reader sharpness/full-screen, scan-to-PDF workflow changes (v5: camera/permission, Manage, debug-overlay removal).
+const CACHE_NAME = 'fylo-v6';
 
 const STATIC_ASSETS = [
   './',

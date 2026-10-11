@@ -53,7 +53,7 @@ const _dom = {
 const _rs = {
   pdf: null, currentPage: 1, totalPages: 0, scale: 1.2, docId: null,
   thumbs: [], searchResults: [], searchIndex: -1,
-  renderTask: null, isRendering: false, lastScale: null,
+  renderTask: null, isRendering: false, lastScale: null, region: null, bmpScale: 1,
   _tx: 0, _ty: 0, _scale: 1,
   canvasWidth: 0, canvasHeight: 0,
   // Aliases for legacy internal code
@@ -80,7 +80,7 @@ function destroyReader(){
   clearTimeout(r._renderTimer); r._renderTimer=null;
   if(r.renderTask){try{r.renderTask.cancel();}catch(e){}r.renderTask=null;}
   if(r.pdf){try{r.pdf.destroy();}catch(e){}r.pdf=null;}
-  r.currentPage=1;r.totalPages=0;r.thumbs=[];r.searchResults=[];r.searchIndex=-1;r.lastScale=null;
+  r.region=null;r.bmpScale=1;clearTimeout(_covTimer);r.currentPage=1;r.totalPages=0;r.thumbs=[];r.searchResults=[];r.searchIndex=-1;r.lastScale=null;
   r._scale=1;r._tx=0;r._ty=0;r.isZooming=false;r.canvasWidth=0;r.canvasHeight=0;
   const ctx=_dom.canvas.getContext('2d');ctx.clearRect(0,0,_dom.canvas.width,_dom.canvas.height);
   _dom.canvas.width=0;_dom.canvas.height=0;
@@ -167,10 +167,7 @@ async function openReader(fileId){
     let fitScale = 1.2;
     try{
       const fp = await pdf.getPage(1);
-      const nv = fp.getViewport({scale:1});
-      const ww = _dom.wrap.clientWidth  || window.innerWidth;
-      const wh = _dom.wrap.clientHeight || Math.max(300, window.innerHeight - 120);
-      fitScale = Math.max(0.4, Math.min(3, Math.min((ww-16)/nv.width, (wh-16)/nv.height)));
+      fitScale = _fitScaleFor(fp);
     }catch(e){}
     _rs.pdf=pdf;
     _rs.currentPage=1;
@@ -195,80 +192,202 @@ async function openReader(fileId){
   }catch(err){console.error(err);toast('Failed to load PDF: '+(err&&err.message?err.message:''));destroyReader();}
 }
 
-async function renderPage(num, forceRender){
-  if(!_rs.pdf||num<1||num>_rs.totalPages)return;
-  // Skip if same page at same scale and not a forced quality re-render
-  if(!forceRender && _rs.currentPage===num && _rs.lastScale===_rs.scale && _rs._scale===1) return;
-  // Cancel any in-progress render
-  if(_rs.isRendering && _rs.renderTask){
-    try{_rs.renderTask.cancel();}catch(e){}
+// ── Render quality ────────────────────────────────────────────────────────────
+// Why PDF pages looked dull on Android (all verified in code, see report):
+//  1. The canvas backing store was `viewport.width` truncated to an integer, but its CSS width was the
+//     untruncated `viewport.width / dpr`, so the bitmap was always stretched by a non-integer factor.
+//  2. The canvas was placed with a fractional CSS translate (centering `(ww - w) / 2`), so every
+//     device pixel of the bitmap landed between two screen pixels and got bilinear-filtered.
+//  3. On devices with dpr < 2 the page was rendered at only 1x–1.5x, then smoothed by the compositor.
+//  4. When zoomed in, the whole page was rasterised as ONE bitmap (scale 5 x dpr 3 on a Letter page is
+//     ~90 MP). That either fails / is downscaled by the WebView or costs hundreds of MB, so deep zoom
+//     was soft or crashed. Now only the visible window (plus a margin) is rasterised at full device
+//     resolution, and it is re-rendered when the user pans/zooms outside it.
+//  5. Thumbnails were drawn at 0.2x and upscaled by CSS (blurry strip).
+const MIN_OUTPUT_DPR   = 2;                  // never render below 2 device px per CSS px
+const BITMAP_BUDGET    = 6 * 1024 * 1024;    // max pixels per bitmap (~24 MB); two exist while swapping
+const MAX_CANVAS_DIM   = 8192;
+const REGION_MARGIN    = 1.6;                // rendered window = visible window x this (per axis), if budget allows
+let _renderToken = 0;
+let _covTimer = null;
+
+function _outputDpr() { return Math.max(window.devicePixelRatio || 1, MIN_OUTPUT_DPR); }
+
+/**
+ * Geometry for rendering `page` at logical scale `wantScale`.
+ * `win` = the part of the page that will be on screen, in page CSS px at `wantScale` ({x0,y0,x1,y1}).
+ * Returns the bitmap size, its CSS size, the whole-page CSS size and (region mode) which part of the page
+ * the bitmap covers. Bitmap px per CSS px is always dpr, i.e. every device pixel is a real rendered pixel.
+ */
+function _canvasMetrics(page, wantScale, win) {
+  const dpr  = _outputDpr();
+  const base = page.getViewport({ scale: 1 });
+  const fullPxW = Math.max(1, Math.round(base.width * wantScale * dpr));
+  const vpScale = fullPxW / base.width;                       // exact integer page width in bitmap px
+  const fullPxH = Math.max(1, Math.ceil(base.height * vpScale));
+  const m = { vpScale, pageW: fullPxW / dpr, pageH: fullPxH / dpr, offX: 0, offY: 0, region: null };
+
+  if (fullPxW * fullPxH <= BITMAP_BUDGET && fullPxW <= MAX_CANVAS_DIM && fullPxH <= MAX_CANVAS_DIM) {
+    m.pxW = fullPxW; m.pxH = fullPxH;                         // whole page in one bitmap
+  } else {
+    // Region mode: rasterise only what is (about to be) visible, centred on the visible window.
+    const vw = Math.max(1, (Math.min(win.x1, m.pageW) - Math.max(win.x0, 0)) * dpr);
+    const vh = Math.max(1, (Math.min(win.y1, m.pageH) - Math.max(win.y0, 0)) * dpr);
+    const f  = Math.max(1, Math.min(REGION_MARGIN, Math.sqrt(BITMAP_BUDGET / (vw * vh))));
+    let rw = Math.min(fullPxW, MAX_CANVAS_DIM, Math.floor(vw * f));
+    let rh = Math.min(fullPxH, MAX_CANVAS_DIM, Math.floor(vh * f), Math.floor(BITMAP_BUDGET / rw));
+    rw = Math.max(1, rw); rh = Math.max(1, rh);
+    const cx = ((Math.max(win.x0, 0) + Math.min(win.x1, m.pageW)) / 2) * dpr;
+    const cy = ((Math.max(win.y0, 0) + Math.min(win.y1, m.pageH)) / 2) * dpr;
+    m.offX = Math.max(0, Math.min(fullPxW - rw, Math.round(cx - rw / 2)));
+    m.offY = Math.max(0, Math.min(fullPxH - rh, Math.round(cy - rh / 2)));
+    m.pxW = rw; m.pxH = rh;
+    m.region = { x: m.offX / dpr, y: m.offY / dpr, w: rw / dpr, h: rh / dpr };
   }
-  _dom.canvas.style.transition='';
-  _rs.isRendering=true;
-  try{
+  m.cssW = m.pxW / dpr; m.cssH = m.pxH / dpr;
+  return m;
+}
+
+/** Fit-to-viewport logical scale for a page (used on open and on rotation / viewport change). */
+function _fitScaleFor(page) {
+  const nv = page.getViewport({ scale: 1 });
+  const ww = _dom.wrap.clientWidth  || window.innerWidth;
+  const wh = _dom.wrap.clientHeight || Math.max(300, window.innerHeight - 56);
+  return Math.max(0.4, Math.min(3, Math.min((ww - 8) / nv.width, (wh - 8) / nv.height)));
+}
+
+/**
+ * Render page `num`.
+ *  forceRender  — re-render even if page/scale are unchanged (quality re-render after zoom / pan)
+ *  targetScale  — logical render scale to bake in (defaults to _rs.scale). The caller must NOT reset
+ *                 _rs._scale itself: the CSS zoom stays on the old bitmap until the new one is ready,
+ *                 then the transform is re-based so the picture does not move.
+ *  resetView    — drop any zoom/pan and centre (page change, rotation)
+ */
+async function renderPage(num, forceRender, targetScale, resetView) {
+  if (!_rs.pdf || num < 1 || num > _rs.totalPages) return;
+  const wantScale = targetScale ?? _rs.scale;
+  if (!forceRender && _rs.currentPage === num && _rs.lastScale === wantScale && _rs._scale === 1) return;
+  if (_rs.isRendering && _rs.renderTask) { try { _rs.renderTask.cancel(); } catch (e) {} }
+  const token = ++_renderToken;
+  _rs.isRendering = true;
+  let buf = null;
+  try {
     const page = await _rs.pdf.getPage(num);
-    if(!_rs.pdf||State.page!=='reader')return;
+    if (token !== _renderToken || !_rs.pdf || State.page !== 'reader') return;
     const canvas = _dom.canvas;
-    const ctx = canvas.getContext('2d');
-    const dpr = window.devicePixelRatio||1;
-    const viewport = page.getViewport({scale:_rs.scale*dpr});
-    const cssWidth = viewport.width/dpr;
-    const cssHeight = viewport.height/dpr;
     const wasNewPage = num !== _rs.currentPage;
-    // Save visual state BEFORE updating canvas size
-    const prevCvW = _rs.canvasWidth;
-    const prevCvH = _rs.canvasHeight;
-    const prevTx  = _rs._tx;
-    const prevTy  = _rs._ty;
-    const prevS   = _rs._scale;
-    canvas.width = viewport.width;
-    canvas.height = viewport.height;
-    canvas.style.width = cssWidth+'px';
-    canvas.style.height = cssHeight+'px';
-    _rs.canvasWidth = cssWidth;
-    _rs.canvasHeight = cssHeight;
-    _rs._scale = 1;
+    const fresh = wasNewPage || resetView || !_rs.canvasWidth;
 
-    _rs.renderTask = page.render({canvasContext:ctx,viewport});
-    await _rs.renderTask.promise;
-    _rs.renderTask=null;
-    _rs.currentPage=num;
-    _rs.lastScale=_rs.scale;
-
-    if(wasNewPage){
-      // New page: center the canvas in the viewport
-      _centerCanvas();
-    } else if(prevCvW > 0){
-      // Quality re-render at new scale: preserve the visual center point.
-      // The canvas visual center was at: prevTx + (prevCvW*prevS)/2, prevTy + (prevCvH*prevS)/2
-      // New canvas size is cssWidth × cssHeight (at _scale=1).
-      // Set _tx so that the same document center is at the same screen position.
-      const scaleRatio = cssWidth / (prevCvW * prevS); // how much the canvas grew
-      // Preserve the screen position of the canvas center
-      const screenCx = prevTx + (prevCvW * prevS) / 2;
-      const screenCy = prevTy + (prevCvH * prevS) / 2;
-      _rs._tx = screenCx - cssWidth  / 2;
-      _rs._ty = screenCy - cssHeight / 2;
-      _clampTransform();
+    // Which part of the page will be on screen once this render lands? (page CSS px at wantScale)
+    const ww = _dom.wrap.clientWidth, wh = _dom.wrap.clientHeight;
+    const baseVp = page.getViewport({ scale: 1 });
+    const pageWc = baseVp.width * wantScale, pageHc = baseVp.height * wantScale;
+    let win;
+    if (fresh) {
+      win = { x0: (pageWc - ww) / 2, y0: (pageHc - wh) / 2, x1: (pageWc + ww) / 2, y1: (pageHc + wh) / 2 };
     } else {
-      _centerCanvas();
+      const q = pageWc / (_rs.canvasWidth * _rs._scale);        // old visual px -> new page CSS px
+      win = { x0: -_rs._tx * q, y0: -_rs._ty * q, x1: (ww - _rs._tx) * q, y1: (wh - _rs._ty) * q };
+    }
+    const m  = _canvasMetrics(page, wantScale, win);
+    const vp = page.getViewport({ scale: m.vpScale });
+    const useBuf = !fresh && canvas.width > 0;
+
+    let surface;
+    if (useBuf) { buf = document.createElement('canvas'); surface = buf; }
+    else        { surface = canvas; }
+    surface.width = m.pxW; surface.height = m.pxH;
+    _dom.canvas.style.transition = '';
+
+    const params = { canvasContext: surface.getContext('2d'), viewport: vp };
+    if (m.offX || m.offY) params.transform = [1, 0, 0, 1, -m.offX, -m.offY];
+    _rs.renderTask = page.render(params);
+    await _rs.renderTask.promise;
+    _rs.renderTask = null;
+    if (token !== _renderToken) return;                  // a newer render took over
+
+    if (useBuf) {                                        // swap in one synchronous step: no blank frame
+      canvas.width = m.pxW; canvas.height = m.pxH;
+      canvas.getContext('2d').drawImage(buf, 0, 0);
+    }
+    // Lay the canvas out at its BITMAP size (whole, exact integers) and scale it down by 1/dpr with a transform.
+    // Sizing it in fractional CSS px (e.g. 3090 / 2.6 = 1188.4615) lets layout round it to 1/64 px and the
+    // compositor pixel-snap it, which resamples the bitmap by a pixel here and there (soft text).
+    canvas.style.width  = m.pxW + 'px';
+    canvas.style.height = m.pxH + 'px';
+    _rs.bmpScale = 1 / _outputDpr();
+    canvas.classList.toggle('region', !!m.region);      // no drop-shadow/rounded corners on a partial bitmap
+
+    // Re-base the transform so the picture stays exactly where the user left it.
+    const prevCW = _rs.canvasWidth, prevS = _rs._scale;
+    const visW = prevCW * prevS, visH = _rs.canvasHeight * prevS;
+    _rs.canvasWidth = m.pageW; _rs.canvasHeight = m.pageH;   // geometry always describes the WHOLE page
+    _rs.region = m.region;                                   // null = bitmap is the whole page
+    _rs.scale = wantScale; _rs.lastScale = wantScale; _rs.currentPage = num;
+    if (fresh) {
+      _rs._scale = 1; _centerCanvas();
+    } else {
+      const ns = visW / m.pageW;
+      if (Math.abs(ns - 1) < 0.004) {                    // normal case: new bitmap == what was on screen
+        _rs._tx += (visW - m.pageW) / 2; _rs._ty += (visH - m.pageH) / 2; _rs._scale = 1;
+      } else {                                           // user kept zooming during the render
+        _rs._scale = ns;
+      }
+      _clampTransform();
     }
     _applyTransform();
-    _dom.pageInput.value=num;
+    _dom.pageInput.value = num;
     updateThumbActive(num);
     updateBookmarkIcon();
-    _dom.prev.disabled=num<=1;
-    _dom.next.disabled=num>=_rs.totalPages;
+    _dom.prev.disabled = num <= 1;
+    _dom.next.disabled = num >= _rs.totalPages;
     updateZoomDisplay();
-  }catch(err){
-    if(err&&err.name==='RenderingCancelledException'){/* ignore */}
-    else if(err&&err.message&&err.message.includes('cancelled')){/* ignore */}
-    else{console.error('Render error:',err);toast('Failed to render page');}
-  }finally{
-    _rs.isRendering=false;
+  } catch (err) {
+    if (err && err.name === 'RenderingCancelledException') { /* superseded */ }
+    else if (err && err.message && err.message.includes('cancelled')) { /* ignore */ }
+    else { console.error('Render error:', err); toast('Failed to render page'); }
+  } finally {
+    if (buf) { buf.width = 0; buf.height = 0; }
+    if (token === _renderToken) _rs.isRendering = false;
   }
 }
 
+/**
+ * Region mode only: if the user panned/zoomed so that part of the screen is outside the rendered window
+ * (or the bitmap is being stretched), re-render around the new view. Runs ~150 ms after motion stops.
+ */
+function _scheduleCoverageCheck() {
+  clearTimeout(_covTimer);
+  _covTimer = setTimeout(() => {
+    const r = _rs;
+    if (!r.pdf || !r.region || State.page !== 'reader') return;
+    if (r.isRendering) { _scheduleCoverageCheck(); return; }
+    const ww = _dom.wrap.clientWidth, wh = _dom.wrap.clientHeight, s = r._scale || 1;
+    const u0 = Math.max(0, (0 - r._tx) / s), u1 = Math.min(r.canvasWidth,  (ww - r._tx) / s);
+    const v0 = Math.max(0, (0 - r._ty) / s), v1 = Math.min(r.canvasHeight, (wh - r._ty) / s);
+    const g = r.region, eps = 0.75;
+    const covered = u0 >= g.x - eps && u1 <= g.x + g.w + eps && v0 >= g.y - eps && v1 <= g.y + g.h + eps;
+    if (!covered || Math.abs(s - 1) > 0.02) renderSharp();
+  }, 150);
+}
+
+/** Bake the current CSS zoom into a fresh, sharp bitmap (call after a zoom gesture settles). */
+function renderSharp() {
+  const r = _rs;
+  if (!r.pdf || State.page !== 'reader') return;
+  const target = Math.max(0.3, Math.min(5, r.scale * r._scale));
+  renderPage(r.currentPage, true, target);
+}
+
+/** Recompute fit-to-screen for the current page (viewport size changed: rotation, nav hidden...). */
+async function refitReader() {
+  if (!_rs.pdf) return;
+  try {
+    const page = await _rs.pdf.getPage(_rs.currentPage);
+    await renderPage(_rs.currentPage, true, _fitScaleFor(page), true);
+  } catch (e) { log.warn('refit failed', e); }
+}
 
 let __thumbGenToken=0;
 async function generateThumbnails(){
@@ -281,7 +400,7 @@ async function generateThumbnails(){
     let c=null;
     try{
       const page = await _rs.pdf.getPage(i);
-      const vp = page.getViewport({scale:0.2});
+      const vp = page.getViewport({scale:0.2*Math.min(3,_outputDpr())});
       c = document.createElement('canvas');c.width=vp.width;c.height=vp.height;
       await page.render({canvasContext:c.getContext('2d'),viewport:vp}).promise;
       if(token!==__thumbGenToken)return;
@@ -368,9 +487,7 @@ function _animateToVisual(targetVis){
       clearTimeout(r._renderTimer);
       r._renderTimer=setTimeout(()=>{
         if(!r.pdf||State.page!=='reader') return;
-        r.scale=Math.max(0.3,Math.min(5, r.scale*r._scale));
-        r._scale=1;
-        renderPage(r.currentPage, true);
+        renderSharp();
       }, 200);
     }
   }
@@ -419,7 +536,18 @@ function goToPage(num){
 
 function _applyTransform(){
   const r = _rs;
-  _dom.canvas.style.transform = `translate(${r._tx}px,${r._ty}px) scale(${r._scale})`;
+  // Region mode: the bitmap covers only part of the page, so offset the canvas to where that part lives.
+  const rg = r.region, ox = rg ? rg.x * r._scale : 0, oy = rg ? rg.y * r._scale : 0;
+  // Snap the translation to whole device pixels: a fractional offset makes the compositor
+  // bilinear-filter the whole bitmap (soft text) even when it is rendered at native resolution.
+  // The viewport itself usually sits at a fractional device-pixel offset (toolbar height x dpr), so the
+  // snap has to be done on the ABSOLUTE position, not on the offset inside the viewport.
+  const d = window.devicePixelRatio || 1;
+  const wr = _dom.wrap.getBoundingClientRect();
+  const x = Math.round((wr.left + r._tx + ox) * d) / d - wr.left;
+  const y = Math.round((wr.top  + r._ty + oy) * d) / d - wr.top;
+  _dom.canvas.style.transform = `translate(${x}px,${y}px) scale(${r._scale * (r.bmpScale || 1)})`;
+  if (rg) _scheduleCoverageCheck();
 }
 
 function _clampTransform(){
@@ -510,8 +638,7 @@ function handleDoubleTap(fx, fy){
         clearTimeout(r._renderTimer);
         r._renderTimer=setTimeout(()=>{
           if(!r.pdf||State.page!=='reader')return;
-          r.scale=Math.max(0.3,Math.min(5,r.scale*r._scale));
-          r._scale=1; renderPage(r.currentPage,true);
+          renderSharp();
         },200);
       }
     }
@@ -647,6 +774,14 @@ export function wireReaderToolbar() {
     _dom.zoomLevel.title = 'Click to reset zoom';
     _dom.zoomLevel.addEventListener('click', () => { if (_rs.pdf) _animateToVisual(_rs.scale); });
   }
+  // The pixel-snapping in _applyTransform depends on where the viewport sits on screen. That is not final
+  // while the page slide-in transition runs or while the toolbar/sidebar change the viewport size, so
+  // re-apply once the geometry settles (otherwise the first page after opening is placed off the pixel grid).
+  const pageEl = document.getElementById('page-reader');
+  pageEl?.addEventListener('transitionend', e => { if (e.target === pageEl && _rs.pdf) _applyTransform(); });
+  if (window.ResizeObserver && _dom.wrap) {
+    new ResizeObserver(() => { if (_rs.pdf && _rs.canvasWidth) { _clampTransform(); _applyTransform(); } }).observe(_dom.wrap);
+  }
   log.info('Reader toolbar wired');
 }
 
@@ -665,7 +800,9 @@ export const ReaderModule = {
   // Exposed for gesture engine (gestures.js imports this module)
   get _rs()             { return _rs; },
   get _dom()            { return _dom; },
-  renderPage:           (n, force) => renderPage(n, force),
+  renderPage:           (n, force, target, reset) => renderPage(n, force, target, reset),
+  renderSharp,
+  refit:                () => refitReader(),
   _applyTransform,
   _clampTransform,
   _centerCanvas,

@@ -78,6 +78,7 @@ async function bootstrap() {
   _safeWire('search',         _wireSearch);
   _safeWire('manage',         _wireManage);
   _safeWire('reader toolbar', wireReaderToolbar);
+  _safeWire('reader chrome',  _wireReaderChrome);
   _safeWire('editor toolbar', wireEditorToolbar);
   _safeWire('settings',       () => SettingsModule.init());
 
@@ -161,12 +162,57 @@ function _registerRoutes() {
   });
   Router.register(PAGES.READER, {
     el: document.getElementById('page-reader'),
-    onLeave: () => ReaderModule.close(),
+    // Reader is a dedicated full-screen mode: the app bar, bottom nav and FAB are hidden and the
+    // document itself cannot scroll (see `.reader-mode` in main.css). Left again in onLeave.
+    onEnter: () => _setReaderMode(true),
+    onLeave: () => { ReaderModule.close(); _setReaderMode(false); },
   });
   Router.register(PAGES.EDITOR, {
     el: document.getElementById('page-editor'),
   });
   // Camera is a fullscreen modal overlay, not a routed page — no registration needed.
+}
+
+// ── Reader full-screen mode ───────────────────────────────────────────────────
+function _setReaderMode(on) {
+  document.documentElement.classList.toggle('reader-mode', on);
+  document.body.classList.toggle('reader-mode', on);
+  if (on) _resetPageScroll();
+}
+
+// Nothing outside the PDF viewport may ever be scrolled while reading. CSS locks overflow; this is the
+// belt-and-braces layer for things CSS cannot stop (focus-induced scroll when the soft keyboard opens
+// for the page-number / search input, overscroll glow, a stray scrolled ancestor).
+function _resetPageScroll() {
+  const se = document.scrollingElement;
+  if (se && (se.scrollTop || se.scrollLeft)) se.scrollTo(0, 0);
+  const mc = document.querySelector('.main-content');
+  if (mc && (mc.scrollTop || mc.scrollLeft)) { mc.scrollTop = 0; mc.scrollLeft = 0; }
+  const pr = document.getElementById('page-reader');
+  if (pr && (pr.scrollTop || pr.scrollLeft)) { pr.scrollTop = 0; pr.scrollLeft = 0; }
+}
+
+function _wireReaderChrome() {
+  const page = document.getElementById('page-reader');
+  if (!page) return;
+
+  // Only the thumbnail strip (and text fields) may scroll by touch; the toolbar and the canvas must not
+  // drag the page. The canvas wrap already handles its own gestures (preventDefault in gestures.js).
+  page.addEventListener('touchmove', e => {
+    if (e.target.closest?.('.reader-thumbs, input, .reader-search-bar')) return;
+    e.preventDefault();
+  }, { passive: false });
+
+  const guard = () => { if (document.documentElement.classList.contains('reader-mode')) _resetPageScroll(); };
+  window.addEventListener('scroll', guard, { passive: true });
+  document.querySelector('.main-content')?.addEventListener('scroll', guard, { passive: true });
+  page.addEventListener('scroll', guard, { passive: true });
+
+  // Reader's own Back button (the app bar is hidden while reading)
+  document.getElementById('reader-back')?.addEventListener('click', () => {
+    const dest = (State.prevPage && State.prevPage !== PAGES.READER) ? State.prevPage : PAGES.FILES;
+    Router.go(dest);
+  });
 }
 
 // ── Global search (own function so a failure elsewhere in startup can never skip it) ──
@@ -344,14 +390,8 @@ function _wireGlobalEvents() {
       const rs = ReaderModule._rs;
       if (!rs?.canvasWidth) return;
       if (major) {
-        // Recalculate fit scale on orientation change
-        const wrap = document.getElementById('reader-canvas-wrap');
-        const fit  = Math.max(0.4, Math.min(3, Math.min(
-          (wrap.clientWidth  - 16) / rs.canvasWidth,
-          (wrap.clientHeight - 16) / rs.canvasHeight,
-        )));
-        rs.scale = fit; rs._scale = 1;
-        ReaderModule.renderPage(rs.currentPage, true);
+        // Orientation / viewport change: recompute fit-to-screen for the current page
+        ReaderModule.refit();
       } else {
         ReaderModule._clampTransform?.();
         ReaderModule._applyTransform?.();

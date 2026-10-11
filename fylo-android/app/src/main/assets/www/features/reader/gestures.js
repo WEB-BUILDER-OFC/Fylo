@@ -127,9 +127,7 @@ export function initGestureEngine(ReaderModule) {
       clearTimeout(rs._renderTimer);
       rs._renderTimer = setTimeout(() => {
         if (!rs.pdf) return;
-        const ns = Math.max(0.3, Math.min(5, rs.scale * rs._scale));
-        rs.scale = ns; rs._scale = 1;
-        renderPage(rs.currentPage, true);
+        ReaderModule.renderSharp();
       }, 180);
       return;
     }
@@ -210,9 +208,7 @@ export function initGestureEngine(ReaderModule) {
     clearTimeout(rs._renderTimer);
     rs._renderTimer = setTimeout(() => {
       if (!rs.pdf) return;
-      const ns2 = Math.max(0.3, Math.min(5, rs.scale * rs._scale));
-      rs.scale = ns2; rs._scale = 1;
-      renderPage(rs.currentPage, true);
+      ReaderModule.renderSharp();
     }, 250);
   }, { passive: false });
 
