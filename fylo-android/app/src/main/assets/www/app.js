@@ -332,11 +332,12 @@ function _wireGlobalEvents() {
     if (e.target.id === 'modal-overlay') closeModal();
   });
 
-  // ── Menu button ──────────────────────────────────────────────────────────
-  // The app bar (and with it this button) is hidden in the Reader, and there is no drawer in the shell,
-  // so the old handler (toggle the Reader sidebar, only while on the Reader page) could never fire.
-  // The button now opens the app menu, built on the existing modal component.
-  document.getElementById('menu-btn')?.addEventListener('click', _openAppMenu);
+  // ── Menu button — toggles reader sidebar when in reader ──────────────────
+  document.getElementById('menu-btn')?.addEventListener('click', () => {
+    if (State.page === PAGES.READER) {
+      document.getElementById('reader-sidebar')?.classList.toggle('open');
+    }
+  });
 
   // ── Nav: aria-current for screen readers ─────────────────────────────────
   document.querySelectorAll('[data-page]').forEach(btn => {
@@ -407,33 +408,6 @@ function _wireGlobalEvents() {
   log.info('Global events wired');
 }
 
-// ── App menu (top-right button) ───────────────────────────────────────────────
-function _openAppMenu() {
-  const isAndroid = typeof window.AndroidBridge !== 'undefined';
-  const ico = d => `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${d}</svg>`;
-  const items = [
-    { id: 'open',     label: 'Open PDF',          icon: ico('<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>') },
-    { id: 'scan',     label: 'Scan document',     icon: ico('<path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/>') },
-    ...(isAndroid ? [{ id: 'device', label: 'PDFs on this device', icon: ico('<rect x="5" y="2" width="14" height="20" rx="2"/><line x1="12" y1="18" x2="12.01" y2="18"/>') }] : []),
-    { id: 'tools',    label: 'All tools',         icon: ico('<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>') },
-    { id: 'settings', label: 'Settings',          icon: ico('<circle cx="12" cy="12" r="3"/><path d="M12 1v4M12 19v4M4.2 4.2l2.8 2.8M17 17l2.8 2.8M1 12h4M19 12h4M4.2 19.8 7 17M17 7l2.8-2.8"/>') },
-  ];
-  openModal('Menu', `<div class="app-menu-list" style="display:flex;flex-direction:column;gap:4px">${
-    items.map(i => `<button type="button" class="recent-item" data-menu="${i.id}" style="width:100%;text-align:left;cursor:pointer;border:1px solid var(--border);color:var(--text-primary)">${i.icon}<span style="font-size:15px;font-weight:500">${i.label}</span></button>`).join('')
-  }</div>`);
-  document.querySelectorAll('#modal-body [data-menu]').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const id = btn.dataset.menu;
-      closeModal();
-      if (id === 'open')          document.getElementById('file-input')?.click();
-      else if (id === 'scan')     bus.emit('camera:openRequest', {});
-      else if (id === 'device')   { Router.go(PAGES.FILES); bus.emit('files:showDeviceTab', {}); }
-      else if (id === 'tools')    Router.go(PAGES.TOOLS);
-      else if (id === 'settings') Router.go(PAGES.SETTINGS);
-    });
-  });
-}
-
 // ── Splash hide ───────────────────────────────────────────────────────────────
 function _hideSplash() {
   const splash = document.getElementById('splash');
@@ -453,28 +427,22 @@ function _hideSplash() {
 window.onerror = () => _hideSplash();
 window.addEventListener('unhandledrejection', () => _hideSplash());
 
-// ── Service Worker ────────────────────────────────────────────────────────────
-// Inside the Android app the web assets ship in the APK (served by WebViewAssetLoader), so a service worker
-// can only serve a *previous* version's cached files after an APK update. The app therefore never registers
-// one; it removes any worker/cache left behind by older builds instead. Browser/PWA builds still register it.
+// ── Service Worker registration ───────────────────────────────────────────────
+// Service Worker registration (also active inside the Android WebView: caches CDN libs for offline use)
 if ('serviceWorker' in navigator) {
-  if (typeof window.AndroidBridge !== 'undefined') {
-    navigator.serviceWorker.getRegistrations()
-      .then(regs => Promise.all(regs.map(r => r.unregister())))
-      .then(() => ('caches' in window) ? caches.keys().then(ks => Promise.all(ks.map(k => caches.delete(k)))) : null)
-      .catch(e => log.warn('Service worker cleanup failed:', e));
-  } else {
-    window.addEventListener('load', () => {
-      navigator.serviceWorker.register('./sw.js', { scope: './' })
-        .then(reg => {
-          log.info('Service Worker registered:', reg.scope);
-          navigator.serviceWorker.addEventListener('message', e => {
-            if (e.data?.type === 'SW_UPDATED') bus.emit('sw:updateAvailable', {});
-          });
-        })
-        .catch(e => log.warn('Service Worker registration failed:', e));
-    });
-  }
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('./sw.js', { scope: './' })
+      .then(reg => {
+        log.info('Service Worker registered:', reg.scope);
+        // Listen for SW update messages
+        navigator.serviceWorker.addEventListener('message', e => {
+          if (e.data?.type === 'SW_UPDATED') {
+            bus.emit('sw:updateAvailable', {});
+          }
+        });
+      })
+      .catch(e => log.warn('Service Worker registration failed:', e));
+  });
 }
 
 // ── Start ─────────────────────────────────────────────────────────────────────

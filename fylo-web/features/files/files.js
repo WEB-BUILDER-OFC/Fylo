@@ -18,7 +18,6 @@ import {
   formatFileSize, formatDate, generateId, ripple, downloadBlob, $
 } from '../../core/ui.js';
 import { createLogger } from '../../core/logger.js';
-import { initDevice, activate as activateDevice, render as renderDevice } from './device.js';
 
 const log = createLogger('Files');
 
@@ -187,7 +186,6 @@ function renderRecent() {
 
 function renderFiles(filteredFiles) {
   const tab       = document.querySelector('.file-tab.active')?.dataset.tab || 'recent';
-  if (tab === 'device') { renderDevice(); return; }       // "On device" tab (Android app only) renders itself
   let files       = filteredFiles ?? (
     tab === 'favorites' ? State.files.filter(f => State.isFavorite(f.id)) :
     tab === 'offline'   ? State.files.filter(f => f.offline) :
@@ -247,12 +245,11 @@ function renderFiles(filteredFiles) {
 
 // ── Wire file tabs ───────────────────────────────────────────────────────────
 function wireFileTabs() {
-  initDevice();
   document.querySelectorAll('.file-tab').forEach(tab => {
     tab.addEventListener('click', () => {
       document.querySelectorAll('.file-tab').forEach(t => t.classList.remove('active'));
       tab.classList.add('active');
-      if (tab.dataset.tab === 'device') activateDevice(); else renderFiles();
+      renderFiles();
     });
   });
 }

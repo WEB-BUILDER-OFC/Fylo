@@ -491,4 +491,3 @@ body.reader-mode{position:fixed;inset:0;width:100%}
 .camera-exit-card h4{font-size:17px;font-weight:700}
 .camera-exit-card p{font-size:14px;color:var(--text-secondary);margin-bottom:6px}
 .camera-exit-card .camera-btn-secondary{width:100%;padding:12px}
-.recent-item.is-busy{opacity:.5;pointer-events:none}

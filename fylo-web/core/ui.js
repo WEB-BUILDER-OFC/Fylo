@@ -28,8 +28,6 @@ bus.on(EVENTS.APP_TOAST, ({ message, duration }) => toast(message, duration));
 
 // ── Modal ─────────────────────────────────────────────────────────────────────
 let _savedFocus = null;
-let _modalSeq = 0;          // bumped by every open/close so a stale close-timer can never clear a newer modal
-let _onModalClose = null;   // one-shot hook: lets long-running work treat "modal dismissed" as "cancel"
 
 export function openModal(title, bodyHTML, footerHTML = '') {
   const overlay = document.getElementById('modal-overlay');
@@ -37,8 +35,6 @@ export function openModal(title, bodyHTML, footerHTML = '') {
   const bEl = document.getElementById('modal-body');
   const fEl = document.getElementById('modal-footer');
   if (!overlay) return;
-  _modalSeq++;
-  _onModalClose = null;
   _savedFocus = document.activeElement;
   tEl.textContent = title;
   bEl.innerHTML   = bodyHTML;
@@ -49,19 +45,12 @@ export function openModal(title, bodyHTML, footerHTML = '') {
   trapFocus(overlay, true);
 }
 
-/** Register a one-shot callback that runs when the current modal is dismissed (X, backdrop, Back, Esc). */
-export function setModalCloseHook(fn) { _onModalClose = fn || null; }
-
 export function closeModal() {
   const overlay = document.getElementById('modal-overlay');
   if (!overlay) return;
-  const hook = _onModalClose; _onModalClose = null;
-  if (hook) { try { hook(); } catch (_) {} }
-  const seq = ++_modalSeq;
   releaseFocusTrap();
   overlay.classList.remove('show');
   setTimeout(() => {
-    if (seq !== _modalSeq) return;          // another modal was opened meanwhile: leave it alone
     overlay.classList.add('hidden');
     const bEl = document.getElementById('modal-body');
     const fEl = document.getElementById('modal-footer');
@@ -138,41 +127,26 @@ export function formatDate(ts) {
 }
 
 // ── Download helper ───────────────────────────────────────────────────────────
-// Resolves { ok, path?, error? } so callers can report truthfully. Failures are also toasted here, so a
-// caller that ignores the result can never fail silently. (In the Android WebView a.click() downloads are
-// not handled at all, so everything goes through the native bridge there.)
 export function downloadBlob(blob, filename) {
-  const fail = error => { toast(`Could not save ${filename}: ${error}`, 5000); return { ok: false, error }; };
-
+  // Android WebView: native bridge handles downloads (a.click() is blocked in WebView)
   if (typeof window.AndroidBridge !== 'undefined') {
-    return new Promise(resolve => {
-      const reader = new FileReader();
-      reader.onerror = () => resolve(fail('could not read the data'));
-      reader.onload = () => {
-        try {
-          const dataUrl = reader.result;
-          const comma   = dataUrl.indexOf(',');
-          const base64  = comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl;
-          const raw     = window.AndroidBridge.saveFile(base64, filename, blob.type || 'application/pdf');
-          let parsed = null;
-          try { parsed = JSON.parse(raw); } catch (_) {}
-          if (parsed && parsed.success) resolve({ ok: true, path: parsed.path });
-          else resolve(fail((parsed && parsed.error) || 'the device refused the write'));
-        } catch (e) { resolve(fail(e.message || String(e))); }
-      };
-      reader.readAsDataURL(blob);
-    });
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = reader.result;
+      const comma   = dataUrl.indexOf(',');
+      const base64  = comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl;
+      window.AndroidBridge.saveFile(base64, filename, blob.type || 'application/pdf');
+    };
+    reader.readAsDataURL(blob);
+    return;
   }
   // Web / PWA: standard anchor download
-  try {
-    const url = URL.createObjectURL(blob);
-    const a   = document.createElement('a');
-    a.href = url; a.download = filename;
-    document.body.appendChild(a); a.click();
-    document.body.removeChild(a);
-    setTimeout(() => URL.revokeObjectURL(url), 5000);
-    return Promise.resolve({ ok: true, path: filename });
-  } catch (e) { return Promise.resolve(fail(e.message || String(e))); }
+  const url = URL.createObjectURL(blob);
+  const a   = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
 
 // ── Misc ──────────────────────────────────────────────────────────────────────
