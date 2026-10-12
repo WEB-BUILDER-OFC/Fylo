@@ -12,7 +12,7 @@ import { Libs }          from '../../core/libs.js';
 import { Router }        from '../../core/router.js';
 import { PAGES }         from '../../core/constants.js';
 import {
-  toast, downloadBlob, openModal, closeModal,
+  toast, downloadBlob, openModal, closeModal, setModalCloseHook,
   formatFileSize, generateId, $
 } from '../../core/ui.js';
 import { FileStorage }   from '../../core/storage.js';
@@ -56,6 +56,53 @@ function pdfDeg(n) {
   const { degrees } = Libs.pdflib;
   return degrees(((n % 360) + 360) % 360);
 }
+
+// ── Shared progress dialog ────────────────────────────────────────────────────
+// One real, updatable progress dialog (instead of a stack of toasts). Dismissing it by ANY route (Cancel, X,
+// backdrop, Android Back) cancels the running operation, so work can never continue invisibly.
+class CancelledError extends Error { constructor() { super('Cancelled'); this.name = 'CancelledError'; } }
+
+function _progressDialog(title) {
+  const state = { cancelled: false, closed: false };
+  openModal(
+    title,
+    `<p id="tool-progress-text" style="margin:0 0 12px;color:var(--text-secondary);font-size:14px">Starting…</p>
+     <div class="storage-track"><div class="storage-fill" id="tool-progress-fill" style="width:0%"></div></div>`,
+    `<button type="button" class="btn btn-secondary" id="tool-progress-cancel">Cancel</button>`
+  );
+  setModalCloseHook(() => { state.cancelled = true; });
+  document.getElementById('tool-progress-cancel')?.addEventListener('click', () => {
+    state.cancelled = true;
+    const b = document.getElementById('tool-progress-cancel');
+    if (b) { b.disabled = true; b.textContent = 'Cancelling…'; }
+  });
+  return {
+    get cancelled() { return state.cancelled; },
+    check() { if (state.cancelled) throw new CancelledError(); },
+    set(text, pct) {
+      if (state.closed) return;
+      const t = document.getElementById('tool-progress-text'); if (t) t.textContent = text;
+      const f = document.getElementById('tool-progress-fill'); if (f && typeof pct === 'number') f.style.width = Math.max(0, Math.min(100, pct)) + '%';
+    },
+    close() { if (state.closed) return; state.closed = true; setModalCloseHook(null); closeModal(); },
+  };
+}
+
+/** Let the UI paint / handle taps between heavy steps. */
+const _tick = () => new Promise(r => setTimeout(r, 0));
+
+function _resultDialog(title, html, buttons = []) {
+  openModal(title, html,
+    buttons.map((b, i) => `<button type="button" class="btn ${b.primary ? 'btn-primary' : 'btn-secondary'}" data-result-btn="${i}">${b.label}</button>`).join('') ||
+    `<button type="button" class="btn btn-primary" data-result-btn="0">OK</button>`);
+  document.querySelectorAll('[data-result-btn]').forEach(el => el.addEventListener('click', () => {
+    const b = buttons[Number(el.dataset.resultBtn)];
+    closeModal();
+    b?.onClick?.();
+  }));
+}
+
+let _opBusy = false;   // only one compress / convert at a time
 
 // ── Save output PDF and import it back into FYLO ─────────────────────────────
 async function _saveAndImport(pdfDoc, filename) {
@@ -335,20 +382,194 @@ async function toolReorder(file, newOrder) {
 }
 
 // ── COMPRESS ──────────────────────────────────────────────────
-async function toolCompress(file) {
+// How it works (honest version): pdf-lib can rewrite a PDF's structure but never recompresses image data, so on
+// its own it saves little or nothing. Most of a scanned / photo PDF is JPEG data, so each JPEG image is decoded,
+// optionally downscaled and re-encoded at lower quality, and kept only if it really got smaller. Vector / text
+// PDFs have nothing to recompress: for those the result is reported truthfully as "could not be reduced".
+const COMPRESS_LEVELS = {
+  light:    { label: 'Light — best quality',  maxDim: 2400, quality: 0.82 },
+  balanced: { label: 'Balanced (recommended)', maxDim: 1800, quality: 0.68 },
+  strong:   { label: 'Strong — smallest size', maxDim: 1300, quality: 0.50 },
+};
+const MIN_SAVING_RATIO = 0.01;   // below 1% is "no reduction", not a success
+
+/** Width, height and component count from a JPEG's SOF marker, or null if it is not a parsable JPEG. */
+function _jpegInfo(b) {
+  if (!b || b.length < 4 || b[0] !== 0xFF || b[1] !== 0xD8) return null;
+  let i = 2;
+  while (i + 9 < b.length) {
+    if (b[i] !== 0xFF) { i++; continue; }
+    const m = b[i + 1];
+    if (m === 0xFF) { i++; continue; }
+    if (m >= 0xC0 && m <= 0xCF && m !== 0xC4 && m !== 0xC8 && m !== 0xCC) {
+      return { h: (b[i + 5] << 8) | b[i + 6], w: (b[i + 7] << 8) | b[i + 8], comps: b[i + 9] };
+    }
+    i += 2 + ((b[i + 2] << 8) | b[i + 3]);
+  }
+  return null;
+}
+
+async function _decodeJpeg(bytes) {
+  const blob = new Blob([bytes], { type: 'image/jpeg' });
+  // imageOrientation 'none': a PDF image stream ignores EXIF rotation, so the bitmap must too.
+  if (typeof createImageBitmap === 'function') {
+    try { return await createImageBitmap(blob, { imageOrientation: 'none' }); } catch (_) { /* fall through */ }
+    try { return await createImageBitmap(blob); } catch (_) { /* fall through */ }
+  }
+  return await new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(blob), img = new Image();
+    img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('decode failed')); };
+    img.src = url;
+  });
+}
+
+async function _recompressJpeg(bytes, info, level) {
+  const scale = Math.min(1, level.maxDim / Math.max(info.w, info.h));
+  const nw = Math.max(1, Math.round(info.w * scale)), nh = Math.max(1, Math.round(info.h * scale));
+  const src = await _decodeJpeg(bytes);
+  const c = document.createElement('canvas');
+  c.width = nw; c.height = nh;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, nw, nh);
+  ctx.drawImage(src, 0, 0, nw, nh);
+  if (src.close) src.close();
+  const blob = await new Promise(res => c.toBlob(res, 'image/jpeg', level.quality));
+  c.width = 0; c.height = 0;
+  if (!blob) throw new Error('encode failed');
+  return { bytes: new Uint8Array(await blob.arrayBuffer()), w: nw, h: nh };
+}
+
+/** Recompress the JPEG images of a loaded pdf-lib document in place. Returns { total, replaced, skipped }. */
+async function _recompressImages(pdf, level, dlg) {
+  const { PDFName, PDFRawStream } = Libs.pdflib;
+  const N = n => PDFName.of(n);
+  const entries = pdf.context.enumerateIndirectObjects();
+  const candidates = [];
+  for (const [ref, obj] of entries) {
+    if (!(obj instanceof PDFRawStream)) continue;
+    const d = obj.dict;
+    if (d.get(N('Subtype')) !== N('Image')) continue;
+    let f = d.get(N('Filter'));
+    if (f && f.asArray) { const a = f.asArray(); f = a.length === 1 ? a[0] : null; }
+    if (f !== N('DCTDecode')) continue;
+    candidates.push([ref, obj]);
+  }
+  const out = { total: candidates.length, replaced: 0, skipped: 0 };
+  for (let i = 0; i < candidates.length; i++) {
+    dlg.check();
+    dlg.set(`Optimising images… ${i + 1} of ${candidates.length}`, 8 + (i / Math.max(1, candidates.length)) * 72);
+    await _tick();
+    const [ref, obj] = candidates[i];
+    const d = obj.dict;
+    try {
+      const info = _jpegInfo(obj.contents);
+      // Leave anything we cannot reproduce faithfully alone: CMYK, custom /Decode, masks, 1-bit stencils.
+      if (!info || info.comps === 4 || d.get(N('Decode')) || d.get(N('Mask')) || d.get(N('ImageMask'))) { out.skipped++; continue; }
+      const r = await _recompressJpeg(obj.contents, info, level);
+      if (r.bytes.length > obj.contents.length * 0.9) { out.skipped++; continue; }   // not worth it
+      const nd = pdf.context.obj({
+        Type: 'XObject', Subtype: 'Image', Width: r.w, Height: r.h,
+        ColorSpace: 'DeviceRGB', BitsPerComponent: 8, Filter: 'DCTDecode',
+      });
+      const sm = d.get(N('SMask'));
+      if (sm) nd.set(N('SMask'), sm);
+      pdf.context.assign(ref, PDFRawStream.of(nd, r.bytes));
+      out.replaced++;
+    } catch (e) {
+      log.warn('Image skipped during compression:', e && e.message);
+      out.skipped++;
+    }
+  }
+  return out;
+}
+
+/** Re-open the result with two independent parsers and check the page count. Throws if it is not a valid PDF. */
+async function _verifyPdf(bytes, expectedPages) {
+  const { PDFDocument } = Libs.pdflib;
+  const again = await PDFDocument.load(bytes, { updateMetadata: false });
+  if (again.getPageCount() !== expectedPages) throw new Error(`page count changed (${expectedPages} → ${again.getPageCount()})`);
+  if (await Libs.waitForPdfJs()) {
+    const doc = await Libs.pdfjs.getDocument({ data: bytes.slice(0) }).promise;
+    try {
+      if (doc.numPages !== expectedPages) throw new Error('PDF.js sees a different page count');
+      await doc.getPage(1);
+    } finally { try { doc.destroy(); } catch (_) {} }
+  }
+}
+
+async function toolCompress(file, levelKey = 'balanced') {
   if (!file) { toast('Select a PDF'); return; }
-  toast('Compressing PDF…');
+  if (_opBusy) { toast('Another operation is still running'); return; }
+  _opBusy = true;
+  const level = COMPRESS_LEVELS[levelKey] || COMPRESS_LEVELS.balanced;
+  const dlg = _progressDialog('Compressing PDF');
   try {
-    if (!await Libs.waitForPdfLib()) { toast('PDF-Lib not loaded.'); return; }
+    dlg.set('Loading PDF…', 2);
+    if (!await Libs.waitForPdfLib()) throw new Error('The PDF library did not load.');
     const { PDFDocument } = Libs.pdflib;
-    const ab  = await file.blob.arrayBuffer();
-    const pdf = await PDFDocument.load(ab, { updateMetadata: false });
-    const bytes = await pdf.save({ useObjectStreams: true });
-    const blob  = new Blob([bytes], { type: 'application/pdf' });
-    const saved = ((file.size - blob.size) / file.size * 100).toFixed(1);
-    downloadBlob(blob, file.name.replace(/\.pdf$/i, '_compressed.pdf'));
-    toast(`Compressed — saved ~${saved}% (${fmtBytes(file.size)} → ${fmtBytes(blob.size)})`);
-  } catch(e) { log.error('Compress failed:', e); toast('Compress failed: ' + e.message); }
+    const inBlob   = file.blob;
+    const origSize = inBlob.size;                         // the real byte count, not the stored metadata
+    const inBytes  = new Uint8Array(await inBlob.arrayBuffer());
+    dlg.check();
+    let pdf;
+    try { pdf = await PDFDocument.load(inBytes, { updateMetadata: false }); }
+    catch (e) {
+      if (/encrypt/i.test(e.message || '') || e.name === 'EncryptedPDFError') throw new Error('This PDF is password protected. Unlock it first.');
+      throw new Error('This file could not be read as a PDF.');
+    }
+    const pages = pdf.getPageCount();
+
+    const img = await _recompressImages(pdf, level, dlg);
+    dlg.check();
+    dlg.set('Writing the new PDF…', 85);
+    await _tick();
+    const outBytes = await pdf.save({ useObjectStreams: true });
+    dlg.check();
+    dlg.set('Checking the result…', 93);
+    await _tick();
+    await _verifyPdf(outBytes, pages);                    // throws => nothing is saved
+    dlg.check();
+
+    const outSize = outBytes.length;
+    const saved   = origSize - outSize;
+    dlg.close();
+
+    if (saved <= origSize * MIN_SAVING_RATIO) {
+      const why = img.total === 0
+        ? 'It contains no photos or scanned images to shrink (text and vector content is already compact).'
+        : `Its ${img.total} image${img.total === 1 ? '' : 's'} could not be made meaningfully smaller at this setting.`;
+      _resultDialog('Could not reduce this PDF',
+        `<p>The result would be <strong>${fmtBytes(outSize)}</strong>, compared with the original <strong>${fmtBytes(origSize)}</strong> — no real saving.</p>
+         <p style="color:var(--text-secondary);font-size:13px">${why} Your original file is unchanged and nothing was saved.</p>`);
+      return;
+    }
+
+    const outName = file.name.replace(/\.pdf$/i, '') + '_compressed.pdf';
+    const outBlob = new Blob([outBytes], { type: 'application/pdf' });
+    const outFile = new File([outBlob], outName, { type: 'application/pdf' });
+    const pct = (saved / origSize * 100).toFixed(1);
+    const dl = await downloadBlob(outBlob, outName);      // reports its own failures
+    let importedId = null;
+    await new Promise(resolve => {
+      bus.emit('files:incoming', { files: [outFile], onSaved: ids => { importedId = ids?.[0] ?? null; resolve(); } });
+    });
+    _resultDialog('PDF compressed',
+      `<p><strong>${fmtBytes(origSize)}</strong> → <strong>${fmtBytes(outSize)}</strong> &nbsp;(${pct}% smaller)</p>
+       <p style="color:var(--text-secondary);font-size:13px">${img.replaced} of ${img.total} image${img.total === 1 ? '' : 's'} optimised. ${
+         importedId ? 'Added to your files as ' + esc(outName) + '.' : 'Could not be added to your files list.'} ${
+         dl.ok ? (dl.path ? 'Saved to ' + esc(dl.path) + '.' : 'Saved.') : 'Saving a copy to the device failed.'}</p>`,
+      [
+        { label: 'Done' },
+        ...(importedId ? [{ label: 'Open', primary: true, onClick: () => bus.emit('reader:openRequest', { fileId: importedId }) }] : []),
+      ]);
+  } catch (e) {
+    dlg.close();
+    if (e instanceof CancelledError) { toast('Compression cancelled — nothing was saved'); }
+    else { log.error('Compress failed:', e); _resultDialog('Compression failed', `<p>${esc(e.message || 'Unknown error')}</p><p style="color:var(--text-secondary);font-size:13px">Nothing was saved and your original file is unchanged.</p>`); }
+  } finally {
+    _opBusy = false;
+  }
 }
 
 // ── IMG → PDF ─────────────────────────────────────────────────
@@ -425,65 +646,83 @@ async function toolImgToPdf(images) {
 }
 
 // ── PDF → IMG ─────────────────────────────────────────────────
-// Safe multi-page export: renders all pages to blobs first, then packages into
-// a ZIP-like sequential download using object URLs — avoids browser popup blocking.
+// Every page is rendered with PDF.js onto a canvas, encoded as PNG/JPG and saved through downloadBlob():
+// the native bridge in the Android app (a.click() downloads do nothing inside a WebView — that was why the old
+// version showed "Rendering page 1 of 2…" and then produced no files), a normal download in the browser.
+// Progress is real, the run can be cancelled, and the final message states exactly how many pages were saved.
+const PDF2IMG_TARGET_SCALE = 2;              // ≈ 144 dpi
+const PDF2IMG_MAX_PIXELS   = 12_000_000;     // keep a single canvas inside what mobile WebViews allow
+
 async function toolPdfToImg(file, format = 'png') {
   if (!file) { toast('Select a PDF'); return; }
-  if (!await Libs.waitForPdfJs()) { toast('PDF.js not loaded.'); return; }
-  toast('Rendering pages…');
+  if (_opBusy) { toast('Another operation is still running'); return; }
+  _opBusy = true;
+  const dlg = _progressDialog('PDF to Image');
+  let pdf = null;
+  const saved = [];
+  let lastPath = '';
   try {
-    const ab   = await file.blob.arrayBuffer();
-    const pdf  = await Libs.pdfjs.getDocument({ data: ab }).promise;
-    const base = file.name.replace(/\.pdf$/i, '');
+    dlg.set('Loading PDF…', 1);
+    if (!await Libs.waitForPdfJs()) throw new Error('The PDF viewer library did not load.');
+    const ab = await file.blob.arrayBuffer();
+    try { pdf = await Libs.pdfjs.getDocument({ data: ab }).promise; }
+    catch (e) {
+      if (e && e.name === 'PasswordException') throw new Error('This PDF is password protected. Unlock it first.');
+      throw new Error('This file could not be read as a PDF.');
+    }
     const n    = pdf.numPages;
+    const base = file.name.replace(/\.pdf$/i, '') || 'document';
     const mime = format === 'png' ? 'image/png' : 'image/jpeg';
     const ext  = format === 'png' ? 'png' : 'jpg';
+    const pad  = String(n).length;
 
-    // Render all pages to blobs (sequential — avoid canvas memory pile-up)
-    const blobs = [];
     for (let i = 1; i <= n; i++) {
-      toast(`Rendering page ${i} of ${n}…`);
+      dlg.check();
+      dlg.set(`Rendering page ${i} of ${n}…`, ((i - 1) / n) * 100);
+      await _tick();
       const page = await pdf.getPage(i);
-      // Scale to ~150 dpi equivalent (reasonable quality, not OOM-inducing)
-      const vp = page.getViewport({ scale: 1.5 });
-      const c  = document.createElement('canvas');
-      c.width  = vp.width;
-      c.height = vp.height;
-      await page.render({ canvasContext: c.getContext('2d'), viewport: vp }).promise;
-      const blob = await new Promise(res => c.toBlob(res, mime, 0.88));
-      blobs.push({ blob, name: `${base}_page${i}.${ext}` });
-      // Release canvas memory
-      c.width = 0; c.height = 0;
-    }
+      try {
+        const v1    = page.getViewport({ scale: 1 });
+        const scale = Math.min(PDF2IMG_TARGET_SCALE, Math.sqrt(PDF2IMG_MAX_PIXELS / (v1.width * v1.height)));
+        const vp    = page.getViewport({ scale });
+        const c     = document.createElement('canvas');
+        c.width = Math.max(1, Math.floor(vp.width)); c.height = Math.max(1, Math.floor(vp.height));
+        const ctx = c.getContext('2d');
+        if (!ctx) throw new Error('The device could not allocate an image for this page.');
+        ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);      // JPG has no transparency
+        await page.render({ canvasContext: ctx, viewport: vp }).promise;
+        dlg.check();
+        const blob = await new Promise(res => c.toBlob(res, mime, 0.92));
+        c.width = 0; c.height = 0;                                           // release canvas memory
+        if (!blob || !blob.size) throw new Error('The page could not be encoded as an image (not enough memory?).');
 
-    if (n === 1) {
-      // Single page — direct download, no popup issue
-      const url = URL.createObjectURL(blobs[0].blob);
-      const a   = document.createElement('a');
-      a.href = url; a.download = blobs[0].name;
-      document.body.appendChild(a); a.click();
-      document.body.removeChild(a);
-      setTimeout(() => URL.revokeObjectURL(url), 5000);
-      toast('Image downloaded');
-    } else {
-      // Multiple pages — sequential async downloads with small delay to avoid blocking
-      // Browsers allow programmatic downloads when triggered in a user-gesture context;
-      // we stagger them with 80 ms gaps so the browser doesn't treat them as popup spam.
-      let done = 0;
-      const downloadNext = () => {
-        if (done >= blobs.length) { toast(`${n} images downloaded`); return; }
-        const { blob, name } = blobs[done++];
-        const url = URL.createObjectURL(blob);
-        const a   = document.createElement('a');
-        a.href = url; a.download = name;
-        document.body.appendChild(a); a.click();
-        document.body.removeChild(a);
-        setTimeout(() => URL.revokeObjectURL(url), 10000);
-        setTimeout(downloadNext, 80);
-      };
-      downloadNext();
+        dlg.set(`Saving page ${i} of ${n}…`, ((i - 0.5) / n) * 100);
+        const name = `${base}_page${String(i).padStart(pad, '0')}.${ext}`;
+        const r = await downloadBlob(blob, name);
+        if (!r.ok) throw new Error(`Saving page ${i} failed: ${r.error}`);
+        saved.push(name);
+        if (r.path) lastPath = r.path.replace(/[^/]*$/, '');
+        // The browser may block bursts of downloads; a short pause keeps them all coming through.
+        if (typeof window.AndroidBridge === 'undefined') await new Promise(res => setTimeout(res, 250));
+      } finally { try { page.cleanup(); } catch (_) {} }
     }
-  } catch(e) { log.error('PdfToImg failed:', e); toast('Conversion failed: ' + e.message); }
+    dlg.set('Done', 100);
+    dlg.close();
+    const where = lastPath ? ` in ${esc(lastPath)}` : '';
+    _resultDialog('Images saved',
+      `<p><strong>${saved.length} of ${n}</strong> page${n === 1 ? '' : 's'} saved as ${ext.toUpperCase()}${where}.</p>`);
+  } catch (e) {
+    dlg.close();
+    const partial = saved.length ? ` ${saved.length} image${saved.length === 1 ? ' was' : 's were'} saved before it stopped.` : ' Nothing was saved.';
+    if (e instanceof CancelledError) { toast('Conversion cancelled.' + partial, 4000); }
+    else {
+      log.error('PdfToImg failed:', e);
+      _resultDialog('Conversion failed', `<p>${esc(e.message || 'Unknown error')}</p><p style="color:var(--text-secondary);font-size:13px">${partial.trim()}</p>`);
+    }
+  } finally {
+    try { pdf && pdf.destroy(); } catch (_) {}
+    _opBusy = false;
+  }
 }
 
 // ── PROTECT ───────────────────────────────────────────────────
@@ -856,7 +1095,13 @@ function showCompressModal() {
   openModal(
     'Compress PDF',
     `<p style="color:var(--text-secondary);margin-bottom:12px">Select a PDF to compress:</p>
-     <div class="tool-file-list" style="max-height:260px;overflow-y:auto">${_fileListHTML('compress-file')}</div>`,
+     <div class="tool-file-list" style="max-height:220px;overflow-y:auto">${_fileListHTML('compress-file')}</div>
+     <div id="compress-options" class="hidden" style="margin-top:16px">
+       <label style="color:var(--text-secondary);font-size:13px">Strength:</label>
+       <select class="select-field" id="compress-level" style="margin-top:8px">
+         ${Object.entries(COMPRESS_LEVELS).map(([k, v]) => `<option value="${k}" ${k === 'balanced' ? 'selected' : ''}>${v.label}</option>`).join('')}
+       </select>
+     </div>`,
     `<button class="btn btn-secondary modal-cancel">Cancel</button>
      <button class="btn btn-primary hidden" id="compress-run-btn">Compress</button>`
   );
@@ -867,10 +1112,17 @@ function showCompressModal() {
       _tool.files = [file];
       document.querySelectorAll('[data-compress-file]').forEach(i => i.style.opacity = '0.4');
       el.style.opacity = '1';
+      document.getElementById('compress-options')?.classList.remove('hidden');
       document.getElementById('compress-run-btn')?.classList.remove('hidden');
     });
   });
-  document.getElementById('compress-run-btn')?.addEventListener('click', () => { closeModal(); toolCompress(_tool.files[0]); });
+  document.getElementById('compress-run-btn')?.addEventListener('click', () => {
+    const lvl = document.getElementById('compress-level')?.value || 'balanced';
+    const file = _tool.files[0];
+    closeModal();
+    // closeModal() clears the modal after 300 ms only if no newer modal exists, so the progress dialog is safe.
+    toolCompress(file, lvl);
+  });
   document.querySelector('.modal-cancel')?.addEventListener('click', closeModal);
 }
 

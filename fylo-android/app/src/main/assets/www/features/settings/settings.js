@@ -13,9 +13,10 @@
 import { bus, EVENTS } from '../../core/eventBus.js';
 import { State, Actions } from '../../core/state.js';
 import { SettingsStorage, storage } from '../../core/storage.js';
-import { toast } from '../../core/ui.js';
+import { toast, downloadBlob, openModal, closeModal, formatFileSize } from '../../core/ui.js';
 import { Router } from '../../core/router.js';
-import { PAGES } from '../../core/constants.js';
+import { PAGES, APP_VERSION, DB_STORES } from '../../core/constants.js';
+import { buildZip } from '../../core/zip.js';
 import { createLogger } from '../../core/logger.js';
 
 const log = createLogger('Settings');
@@ -52,8 +53,24 @@ export function renderSettings() {
   if (darkToggle)   darkToggle.checked   = s.darkMode;
   if (motionToggle) motionToggle.checked = s.reduceMotion;
 
+  _renderVersion();
+
   // Sync storage meter
   bus.emit('files:updateStorage');
+}
+
+// Shows what is really installed: the web layer version, plus the APK's own version when running in the app.
+function _renderVersion() {
+  const el = document.getElementById('app-version');
+  if (!el) return;
+  let text = `FYLO ${APP_VERSION}`;
+  try {
+    if (window.AndroidBridge && typeof window.AndroidBridge.getAppVersion === 'function') {
+      const v = JSON.parse(window.AndroidBridge.getAppVersion() || '{}');
+      if (v.versionName) text += ` · app ${v.versionName} (build ${v.versionCode})`;
+    }
+  } catch (_) { /* version info is cosmetic */ }
+  el.textContent = text;
 }
 
 // ── PWA install ───────────────────────────────────────────────────────────────
@@ -73,31 +90,113 @@ export function initPWA() {
 }
 
 // ── Clear cache ───────────────────────────────────────────────────────────────
+// Removes ONLY disposable data: browser/service-worker caches, and (Android) temporary share/export files and the
+// WebView HTTP cache. Saved PDFs, bookmarks, favorites and settings live in IndexedDB and are never touched.
+let _clearing = false;
 async function _clearCache() {
+  if (_clearing) return;
+  _clearing = true;
   try {
+    let caches_removed = 0, tempFiles = 0, tempBytes = 0;
     if ('caches' in window) {
       const keys = await caches.keys();
       await Promise.all(keys.map(k => caches.delete(k)));
+      caches_removed = keys.length;
     }
-    toast('Cache cleared — reload to fetch fresh resources');
-  } catch(e) { toast('Could not clear cache'); }
+    if (window.AndroidBridge && typeof window.AndroidBridge.clearTempFiles === 'function') {
+      try {
+        const r = JSON.parse(window.AndroidBridge.clearTempFiles() || '{}');
+        tempFiles = r.count || 0; tempBytes = r.freedBytes || 0;
+      } catch (e) { log.warn('clearTempFiles failed:', e); }
+    }
+    if (tempFiles > 0)            toast(`Cache cleared — ${tempFiles} temporary file${tempFiles === 1 ? '' : 's'} removed (${formatFileSize(tempBytes)} freed). Your PDFs and settings are untouched.`, 5000);
+    else if (caches_removed > 0)  toast('Cache cleared. Your PDFs and settings are untouched.', 4000);
+    else                          toast('Nothing to clear — no temporary data was stored.', 4000);
+  } catch (e) {
+    log.error('Clear cache failed:', e);
+    toast('Could not clear the cache');
+  } finally { _clearing = false; }
 }
 
-// ── Export data (list of file names) ─────────────────────────────────────────
-function _exportData() {
-  const data = {
-    exportedAt: new Date().toISOString(),
-    files: State.files.map(f => ({ name: f.name, size: f.size, date: f.date })),
-    fileCount: State.files.length,
-  };
-  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-  const url  = URL.createObjectURL(blob);
-  const a    = document.createElement('a');
-  a.href = url; a.download = 'fylo-data-export.json';
-  document.body.appendChild(a); a.click();
-  document.body.removeChild(a);
-  setTimeout(() => URL.revokeObjectURL(url), 5000);
-  toast('Data exported');
+// ── Export data ───────────────────────────────────────────────────────────────
+// Produces ONE real backup file: fylo-backup-YYYY-MM-DD.zip containing
+//   fylo-backup.json   settings, favorites, bookmarks and the list of files (with whether each PDF is included)
+//   files/<name>.pdf   the saved PDFs themselves, up to a total size limit (bridge transfers are held in memory)
+// Anything left out is listed in the JSON and in the message — never silently dropped.
+const EXPORT_PDF_BYTES_LIMIT = 48 * 1024 * 1024;
+let _exporting = false;
+
+function _safeEntryName(name, used) {
+  let base = String(name || 'document.pdf').replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').trim() || 'document.pdf';
+  if (!/\.pdf$/i.test(base)) base += '.pdf';
+  let candidate = base, n = 1;
+  while (used.has(candidate.toLowerCase())) { n++; candidate = base.replace(/\.pdf$/i, '') + ` (${n}).pdf`; }
+  used.add(candidate.toLowerCase());
+  return candidate;
+}
+
+async function _collectBackup() {
+  const favorites = (await SettingsStorage.load('favorites')) || [];
+  const bookmarks = ((await storage.getAll(DB_STORES.BOOKMARKS)) || []).map(b => ({ fileId: b.id, pages: b.pages || [] }));
+  const settings  = { darkMode: State.settings.darkMode, reduceMotion: State.settings.reduceMotion };
+  return { favorites, bookmarks, settings };
+}
+
+async function _exportData() {
+  if (_exporting) return;
+  _exporting = true;
+  toast('Preparing backup…');
+  try {
+    const { favorites, bookmarks, settings } = await _collectBackup();
+    const used = new Set(['fylo-backup.json']);
+    const entries = [];
+    const fileIndex = [];
+    let total = 0, included = 0, skippedTooBig = 0, skippedMissing = 0;
+
+    for (const f of State.files) {
+      const rec = { id: f.id, name: f.name, size: f.size, lastModified: f.lastModified ?? null, addedAt: f.date ?? null, favorite: favorites.includes(f.id), included: false };
+      const blob = f.blob;
+      if (!blob || !blob.size) { skippedMissing++; rec.reason = 'file data not available'; }
+      else if (total + blob.size > EXPORT_PDF_BYTES_LIMIT) { skippedTooBig++; rec.reason = 'over the backup size limit'; }
+      else {
+        const entryName = 'files/' + _safeEntryName(f.name, used);
+        entries.push({ name: entryName, data: new Uint8Array(await blob.arrayBuffer()) });
+        total += blob.size; included++;
+        rec.included = true; rec.path = entryName;
+      }
+      fileIndex.push(rec);
+    }
+
+    const manifest = {
+      app: 'FYLO', appVersion: APP_VERSION, exportedAt: new Date().toISOString(),
+      settings, favorites, bookmarks,
+      files: fileIndex,
+      summary: { filesTotal: State.files.length, pdfsIncluded: included, pdfsNotIncluded: skippedTooBig + skippedMissing, bookmarkedDocuments: bookmarks.length },
+    };
+    entries.unshift({ name: 'fylo-backup.json', data: new TextEncoder().encode(JSON.stringify(manifest, null, 2)) });
+
+    const zip  = buildZip(entries);
+    const date = new Date().toISOString().slice(0, 10);
+    const name = `fylo-backup-${date}.zip`;
+    const r = await downloadBlob(zip, name);
+    if (!r.ok) return;                                       // downloadBlob already told the user why
+
+    const left = skippedTooBig + skippedMissing;
+    const html = `<p>Backup <strong>${name}</strong> (${formatFileSize(zip.size)}) saved${r.path ? ' to <strong>' + r.path.replace(/</g, '&lt;') + '</strong>' : ''}.</p>
+      <p style="color:var(--text-secondary);font-size:13px">${included} PDF${included === 1 ? '' : 's'}, ${bookmarks.length} bookmarked document${bookmarks.length === 1 ? '' : 's'}, ${favorites.length} favorite${favorites.length === 1 ? '' : 's'} and your settings.${
+        left ? ` <strong>${left} PDF${left === 1 ? ' was' : 's were'} not included</strong> (${skippedTooBig ? skippedTooBig + ' over the ' + formatFileSize(EXPORT_PDF_BYTES_LIMIT) + ' limit' : ''}${skippedTooBig && skippedMissing ? ', ' : ''}${skippedMissing ? skippedMissing + ' without stored data' : ''}); they are listed in fylo-backup.json.` : ''}</p>`;
+    const canShare = !!(window.AndroidBridge && typeof window.AndroidBridge.shareFile === 'function');
+    openModal('Backup saved', html,
+      `${canShare ? '<button type="button" class="btn btn-secondary" id="export-share">Share</button>' : ''}<button type="button" class="btn btn-primary" id="export-done">Done</button>`);
+    document.getElementById('export-done')?.addEventListener('click', closeModal);
+    document.getElementById('export-share')?.addEventListener('click', async () => {
+      try { const { androidShareBlob } = await import('../../core/android-bridge.js'); androidShareBlob(zip, name); }
+      catch (e) { toast('Could not open the share sheet'); }
+    });
+  } catch (e) {
+    log.error('Export failed:', e);
+    toast('Export failed: ' + (e.message || e), 5000);
+  } finally { _exporting = false; }
 }
 
 // ── Event wiring (called once at startup) ─────────────────────────────────────

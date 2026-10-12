@@ -5,7 +5,7 @@
  */
 
 export const APP_NAME    = 'FYLO';
-export const APP_VERSION = '2.0.0';
+export const APP_VERSION = '2.1.0';
 
 // PDF library versions
 export const PDFJS_VERSION  = '3.11.174';

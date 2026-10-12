@@ -1,0 +1,330 @@
+--- work/native/MainActivity.orig.java	2026-10-12 01:21:12.516949530 +0530
++++ work/native/MainActivity.java	2026-10-12 01:21:12.540912765 +0530
+@@ -35,12 +35,19 @@
+ import androidx.webkit.WebViewClientCompat;
+ import androidx.webkit.WebViewCompat;
+ import com.fylo.app.MainActivity;
++import java.io.ByteArrayInputStream;
+ import java.io.ByteArrayOutputStream;
+ import java.io.File;
+ import java.io.FileOutputStream;
+ import java.io.InputStream;
+ import java.io.OutputStream;
+ import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.Map;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.atomic.AtomicBoolean;
++import org.json.JSONObject;
+ import java.util.Iterator;
+ import java.util.List;
+ 
+@@ -58,6 +65,24 @@
+     private Intent mPendingIntent = null;
+     private PermissionRequest mPendingWebPermission = null;
+     private boolean mCameraPermissionInFlight = false;
++
++    // ── Device PDFs (granted folders + FYLO's own downloads; see DevicePdfs) ──
++    private volatile Map<String, Uri> mDeviceRegistry = new HashMap<>();   // id -> content URI, only ids from the last scan
++    private final AtomicBoolean mScanRunning = new AtomicBoolean(false);
++    private final ExecutorService mScanIo = Executors.newSingleThreadExecutor();
++    private final ExecutorService mThumbIo = Executors.newSingleThreadExecutor();
++    private final ActivityResultLauncher<Uri> mFolderPicker = registerForActivityResult(new ActivityResultContracts.OpenDocumentTree(), new ActivityResultCallback<Uri>() {
++        @Override
++        public void onActivityResult(Uri uri) {
++            boolean ok = false;
++            String msg = "cancelled";
++            if (uri != null) {
++                ok = DevicePdfs.persistTree(MainActivity.this, uri);
++                msg = ok ? "granted" : "failed";
++            }
++            callJs("window.fyloOnDeviceFolderPicked&&window.fyloOnDeviceFolderPicked(" + ok + "," + JSONObject.quote(msg) + ")");
++        }
++    });
+     private final ActivityResultLauncher<String> mCameraPermissionLauncher = registerForActivityResult(new ActivityResultContracts.RequestPermission(), new ActivityResultCallback() { // from class: com.fylo.app.MainActivity$$ExternalSyntheticLambda3
+         @Override // androidx.activity.result.ActivityResultCallback
+         public final void onActivityResult(Object obj) {
+@@ -108,7 +133,7 @@
+     }
+ 
+     private void setupWebView() {
+-        WebViewAssetLoader assetLoader = new WebViewAssetLoader.Builder().setDomain("appassets.androidplatform.net").addPathHandler("/assets/", new WebViewAssetLoader.AssetsPathHandler(this)).build();
++        WebViewAssetLoader assetLoader = new WebViewAssetLoader.Builder().setDomain("appassets.androidplatform.net").addPathHandler("/assets/", new WebViewAssetLoader.AssetsPathHandler(this)).addPathHandler("/device/", new DeviceFileHandler()).build();
+         WebSettings settings = this.mWebView.getSettings();
+         settings.setJavaScriptEnabled(true);
+         settings.setDomStorageEnabled(true);
+@@ -491,6 +516,55 @@
+         }
+     }
+ 
++    /** Run JS on the UI thread (no-op if the view is gone). */
++    private void callJs(final String js) {
++        runOnUiThread(new Runnable() {
++            @Override
++            public void run() {
++                if (mWebView != null) mWebView.evaluateJavascript(js, null);
++            }
++        });
++    }
++
++    /**
++     * Streams ONE selected device PDF to the web layer on demand: /device/<id>.pdf. Only ids produced by the last
++     * scan resolve, so JS can never ask for an arbitrary content:// URI. Nothing is copied to app storage here.
++     */
++    private final class DeviceFileHandler implements WebViewAssetLoader.PathHandler {
++        @Override
++        public WebResourceResponse handle(String path) {
++            String id = path == null ? "" : path;
++            int dot = id.indexOf('.');
++            if (dot > 0) id = id.substring(0, dot);
++            Map<String, Uri> reg = mDeviceRegistry;
++            Uri uri = reg == null ? null : reg.get(id);
++            if (uri == null) return deviceError(404, "Not Found");
++            try {
++                InputStream is = getContentResolver().openInputStream(uri);
++                if (is == null) return deviceError(404, "Not Found");
++                Map<String, String> h = new HashMap<>();
++                h.put("Cache-Control", "no-store");
++                return new WebResourceResponse("application/pdf", null, 200, "OK", h, is);
++            } catch (Exception e) {                                   // deleted, moved, permission revoked
++                Log.w(TAG, "device file open failed: " + e);
++                return deviceError(410, "Gone");
++            }
++        }
++
++        private WebResourceResponse deviceError(int code, String reason) {
++            Map<String, String> h = new HashMap<>();
++            h.put("Cache-Control", "no-store");
++            return new WebResourceResponse("text/plain", "utf-8", code, reason, h, new ByteArrayInputStream(new byte[0]));
++        }
++    }
++
++    @Override
++    protected void onDestroy() {
++        super.onDestroy();
++        mScanIo.shutdownNow();
++        mThumbIo.shutdownNow();
++    }
++
+     @Override // androidx.activity.ComponentActivity, android.app.Activity
+     public void onBackPressed() {
+         this.mWebView.evaluateJavascript("window.fyloHandleBack && window.fyloHandleBack()", new ValueCallback() { // from class: com.fylo.app.MainActivity$$ExternalSyntheticLambda2
+@@ -522,55 +596,59 @@
+                 }
+                 if (!safeName.contains("/") && !safeName.contains("\\") && !safeName.contains("..")) {
+                     byte[] bytes = Base64.decode(base64, 0);
+-                    File cacheFile = new File(MainActivity.this.getCacheDir(), safeName);
+-                    FileOutputStream fos = new FileOutputStream(cacheFile);
++                    String mime = (mimeType == null || mimeType.isEmpty()) ? "application/pdf" : mimeType;
++                    if (Build.VERSION.SDK_INT < 29) {
++                        // Pre-scoped-storage fallback: app-specific external folder (no storage permission needed)
++                        File dir = new File(MainActivity.this.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "FYLO");
++                        if (!dir.exists() && !dir.mkdirs()) return saveError("Could not create the output folder");
++                        File out = new File(dir, safeName);
++                        FileOutputStream fos = new FileOutputStream(out);
++                        try { fos.write(bytes); } finally { fos.close(); }
++                        showSaved(safeName);
++                        return saveOk("Android/data/" + getPackageName() + "/files/Download/FYLO/" + safeName);
++                    }
++                    ContentValues values = new ContentValues();
++                    values.put("_display_name", safeName);
++                    values.put("mime_type", mime);
++                    values.put("relative_path", Environment.DIRECTORY_DOWNLOADS + "/FYLO");
++                    values.put("is_pending", (Integer) 1);
++                    Uri collection = MediaStore.Downloads.getContentUri("external_primary");
++                    Uri itemUri = MainActivity.this.getContentResolver().insert(collection, values);
++                    if (itemUri == null) return saveError("Android refused to create the file");
+                     try {
+-                        fos.write(bytes);
+-                        fos.close();
+-                        ContentValues values = new ContentValues();
+-                        values.put("_display_name", safeName);
+-                        values.put("mime_type", (mimeType == null || mimeType.isEmpty()) ? "application/pdf" : mimeType);
+-                        values.put("relative_path", Environment.DIRECTORY_DOWNLOADS + "/FYLO");
+-                        values.put("is_pending", (Integer) 1);
+-                        Uri collection = MediaStore.Downloads.getContentUri("external_primary");
+-                        Uri itemUri = MainActivity.this.getContentResolver().insert(collection, values);
+-                        if (itemUri != null) {
+-                            OutputStream os = MainActivity.this.getContentResolver().openOutputStream(itemUri);
+-                            if (os != null) {
+-                                try {
+-                                    os.write(bytes);
+-                                } finally {
+-                                }
+-                            }
+-                            if (os != null) {
+-                                os.close();
+-                            }
+-                            values.clear();
+-                            values.put("is_pending", (Integer) 0);
+-                            MainActivity.this.getContentResolver().update(itemUri, values, null, null);
+-                        }
+-                        cacheFile.delete();
+-                        final String savedName = safeName;
+-                        MainActivity.this.runOnUiThread(new Runnable() { // from class: com.fylo.app.MainActivity$FyloBridge$$ExternalSyntheticLambda3
+-                            @Override // java.lang.Runnable
+-                            public final void run() {
+-                                MainActivity.FyloBridge.this.lambda$saveFile$0(savedName);
+-                            }
+-                        });
+-                        return "{\"success\":true,\"path\":\"Downloads/FYLO/" + safeName + "\"}";
+-                    } finally {
++                        OutputStream os = MainActivity.this.getContentResolver().openOutputStream(itemUri);
++                        if (os == null) throw new java.io.IOException("Could not open the output stream");
++                        try { os.write(bytes); } finally { os.close(); }
++                        values.clear();
++                        values.put("is_pending", (Integer) 0);
++                        MainActivity.this.getContentResolver().update(itemUri, values, null, null);
++                    } catch (Exception writeFailure) {
++                        try { MainActivity.this.getContentResolver().delete(itemUri, null, null); } catch (Exception ignored) { }   // never leave a half-written/pending file
++                        throw writeFailure;
+                     }
++                    showSaved(safeName);
++                    return saveOk("Downloads/FYLO/" + safeName);
+                 }
+                 return "{\"success\":false,\"error\":\"Invalid filename\"}";
+             } catch (Exception e) {
+                 Log.e(MainActivity.TAG, "saveFile error", e);
+-                return "{\"success\":false,\"error\":\"" + e.getMessage() + "\"}";
++                return saveError(String.valueOf(e.getMessage()));
+             }
+         }
+ 
+-        /* JADX INFO: Access modifiers changed from: private */
+-        public /* synthetic */ void lambda$saveFile$0(String savedName) {
+-            Toast.makeText(MainActivity.this, "Saved: " + savedName, 0).show();
++        private String saveOk(String path) {
++            try { return new JSONObject().put("success", true).put("path", path).toString(); } catch (Exception e) { return "{\"success\":true}"; }
++        }
++
++        private String saveError(String message) {
++            try { return new JSONObject().put("success", false).put("error", message).toString(); } catch (Exception e) { return "{\"success\":false}"; }
++        }
++
++        private void showSaved(final String savedName) {
++            MainActivity.this.runOnUiThread(new Runnable() {
++                @Override
++                public void run() { Toast.makeText(MainActivity.this, "Saved: " + savedName, 0).show(); }
++            });
+         }
+ 
+         @JavascriptInterface
+@@ -669,6 +747,117 @@
+             Toast.makeText(MainActivity.this, message, 0).show();
+         }
+ 
++        // ── Device PDFs ───────────────────────────────────────────────────────────
++        @JavascriptInterface
++        public void pickPdfFolder() {
++            MainActivity.this.runOnUiThread(new Runnable() {
++                @Override
++                public void run() {
++                    try {
++                        MainActivity.this.mFolderPicker.launch(null);
++                    } catch (Exception e) {
++                        Log.e(MainActivity.TAG, "folder picker failed", e);
++                        MainActivity.this.callJs("window.fyloOnDeviceFolderPicked&&window.fyloOnDeviceFolderPicked(false,\"failed\")");
++                    }
++                }
++            });
++        }
++
++        @JavascriptInterface
++        public String getPdfFolders() {
++            return DevicePdfs.foldersJson(MainActivity.this);
++        }
++
++        @JavascriptInterface
++        public boolean removePdfFolder(String uri) {
++            try { return DevicePdfs.releaseTree(MainActivity.this, Uri.parse(uri)); } catch (Exception e) { return false; }
++        }
++
++        /** Starts a background scan; the result is delivered to window.fyloOnDevicePdfs(json). Returns "started" or "busy". */
++        @JavascriptInterface
++        public String scanDevicePdfs() {
++            if (!MainActivity.this.mScanRunning.compareAndSet(false, true)) return "busy";
++            try {
++                MainActivity.this.mScanIo.execute(new Runnable() {
++                    @Override
++                    public void run() {
++                        String json;
++                        try {
++                            DevicePdfs.Result r = DevicePdfs.scan(MainActivity.this);
++                            MainActivity.this.mDeviceRegistry = DevicePdfs.registryOf(r);
++                            json = DevicePdfs.toJson(r);
++                        } catch (Throwable t) {
++                            Log.e(MainActivity.TAG, "scan failed", t);
++                            json = "{\"items\":[],\"errors\":[\"Scan failed\"],\"truncated\":false}";
++                        } finally {
++                            MainActivity.this.mScanRunning.set(false);
++                        }
++                        MainActivity.this.callJs("window.fyloOnDevicePdfs&&window.fyloOnDevicePdfs(" + JSONObject.quote(json) + ")");
++                    }
++                });
++            } catch (Exception e) {                          // executor shut down
++                MainActivity.this.mScanRunning.set(false);
++                return "failed";
++            }
++            return "started";
++        }
++
++        /** Renders page 1 natively; the result arrives as window.fyloOnDevicePdfThumb(id, dataUrl|null). */
++        @JavascriptInterface
++        public void requestDevicePdfThumb(final String id) {
++            try {
++                MainActivity.this.mThumbIo.execute(new Runnable() {
++                    @Override
++                    public void run() {
++                        Map<String, Uri> reg = MainActivity.this.mDeviceRegistry;
++                        Uri uri = reg == null ? null : reg.get(id);
++                        String data = uri == null ? null : DevicePdfs.thumbnail(MainActivity.this, uri);
++                        MainActivity.this.callJs("window.fyloOnDevicePdfThumb&&window.fyloOnDevicePdfThumb(" + JSONObject.quote(id) + "," + (data == null ? "null" : JSONObject.quote(data)) + ")");
++                    }
++                });
++            } catch (Exception ignored) { }
++        }
++
++        // ── Maintenance ───────────────────────────────────────────────────────────
++        /** Deletes only temporary files (share/export leftovers in the app cache dir) and the WebView HTTP cache. */
++        @JavascriptInterface
++        public String clearTempFiles() {
++            long freed = 0;
++            int count = 0;
++            try {
++                File[] files = MainActivity.this.getCacheDir().listFiles();
++                if (files != null) {
++                    for (File f : files) {
++                        if (!f.isFile()) continue;                 // never touch directories (WebView keeps its own there)
++                        long len = f.length();
++                        if (f.delete()) { freed += len; count++; }
++                    }
++                }
++            } catch (Exception e) {
++                Log.w(MainActivity.TAG, "clearTempFiles failed", e);
++            }
++            MainActivity.this.runOnUiThread(new Runnable() {
++                @Override
++                public void run() {
++                    try { MainActivity.this.mWebView.clearCache(false); } catch (Exception ignored) { }
++                }
++            });
++            try { return new JSONObject().put("success", true).put("freedBytes", freed).put("count", count).toString(); }
++            catch (Exception e) { return "{\"success\":true}"; }
++        }
++
++        /** {"versionName","versionCode","lastUpdate"} of the installed APK, so the UI can show what is really installed. */
++        @JavascriptInterface
++        public String getAppVersion() {
++            try {
++                PackageInfo pi = MainActivity.this.getPackageManager().getPackageInfo(MainActivity.this.getPackageName(), 0);
++                long code = Build.VERSION.SDK_INT >= 28 ? pi.getLongVersionCode() : pi.versionCode;
++                return new JSONObject().put("versionName", pi.versionName).put("versionCode", code).put("lastUpdate", pi.lastUpdateTime).toString();
++            } catch (Exception e) {
++                return "{}";
++            }
++        }
++
+         @JavascriptInterface
+         public String getPlatform() {
+             return "android";
