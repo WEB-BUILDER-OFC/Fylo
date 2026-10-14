@@ -38,6 +38,9 @@ import { CameraModule }  from './features/camera/index.js';
 import { ToolsModule }   from './features/tools/index.js';
 import { FilesModule }   from './features/files/index.js';
 import { SettingsModule } from './features/settings/index.js';
+import { MenuModule }     from './features/menu/index.js';
+import { Device }         from './core/device.js';
+import { APP_VERSION }    from './core/constants.js';
 
 
 const log = createLogger('App');
@@ -81,6 +84,7 @@ async function bootstrap() {
   _safeWire('reader chrome',  _wireReaderChrome);
   _safeWire('editor toolbar', wireEditorToolbar);
   _safeWire('settings',       () => SettingsModule.init());
+  _safeWire('menu',           () => { MenuModule.init(); _wireMenuActions(); });
 
   // 7. Global events
   _safeWire('global events',  _wireGlobalEvents);
@@ -292,6 +296,14 @@ function _wireGlobalEvents() {
   document.querySelectorAll('.nav-item[data-page]').forEach(item => {
     item.addEventListener('click', e => { ripple(e, item); Router.go(item.dataset.page); });
   });
+  // Keep the bottom-bar highlight in step with the real page (menu shortcuts and deep links navigate without a tap on it).
+  bus.on(EVENTS.APP_NAV, ({ page }) => {
+    document.querySelectorAll('.nav-item[data-page]').forEach(i => {
+      const on = i.dataset.page === page;
+      i.classList.toggle('active', on);
+      if (on) i.setAttribute('aria-current', 'page'); else i.removeAttribute('aria-current');
+    });
+  });
   document.getElementById('back-btn')?.addEventListener('click',
     () => Router.go(State.prevPage || PAGES.HOME));
 
@@ -330,13 +342,6 @@ function _wireGlobalEvents() {
   document.getElementById('modal-close')?.addEventListener('click', closeModal);
   document.getElementById('modal-overlay')?.addEventListener('click', e => {
     if (e.target.id === 'modal-overlay') closeModal();
-  });
-
-  // ── Menu button — toggles reader sidebar when in reader ──────────────────
-  document.getElementById('menu-btn')?.addEventListener('click', () => {
-    if (State.page === PAGES.READER) {
-      document.getElementById('reader-sidebar')?.classList.toggle('open');
-    }
   });
 
   // ── Nav: aria-current for screen readers ─────────────────────────────────
@@ -408,6 +413,24 @@ function _wireGlobalEvents() {
   log.info('Global events wired');
 }
 
+// ── Menu actions ──────────────────────────────────────────────────────────────
+// The menu module only announces which entry was chosen; navigation lives here, next to the modules it needs.
+function _wireMenuActions() {
+  bus.on('menu:action', ({ action }) => {
+    if (action.startsWith('nav:'))  { Router.go(action.slice(4)); return; }
+    switch (action) {
+      case 'ondevice':
+        Router.go(PAGES.FILES).then(() => bus.emit('files:selectTab', { tab: 'device' }));
+        break;
+      case 'open':   document.getElementById('file-input')?.click(); break;   // same tick: still inside the tap gesture
+      case 'scan':   bus.emit('camera:openRequest', {}); break;
+      default:       // a tool id (merge, compress, pdf-to-img, img-to-pdf …)
+        Router.go(PAGES.TOOLS);
+        setTimeout(() => ToolsModule.startFlow(action), 150);
+    }
+  });
+}
+
 // ── Splash hide ───────────────────────────────────────────────────────────────
 function _hideSplash() {
   const splash = document.getElementById('splash');
@@ -428,17 +451,17 @@ window.onerror = () => _hideSplash();
 window.addEventListener('unhandledrejection', () => _hideSplash());
 
 // ── Service Worker registration ───────────────────────────────────────────────
-// Service Worker registration (also active inside the Android WebView: caches CDN libs for offline use)
-if ('serviceWorker' in navigator) {
+// Browser/PWA only. The Android app ships every file inside the APK, so a service worker adds nothing there —
+// and a cache-first worker is exactly what can keep serving an OLD copy of the app after the APK was updated.
+// (MainActivity also removes any worker left behind by an older build.)
+// The version in the URL makes every release a new worker script, so the browser always installs the new one.
+if ('serviceWorker' in navigator && !Device.isAndroid) {
   window.addEventListener('load', () => {
-    navigator.serviceWorker.register('./sw.js', { scope: './' })
+    navigator.serviceWorker.register(`./sw.js?v=${encodeURIComponent(APP_VERSION)}`, { scope: './' })
       .then(reg => {
         log.info('Service Worker registered:', reg.scope);
-        // Listen for SW update messages
         navigator.serviceWorker.addEventListener('message', e => {
-          if (e.data?.type === 'SW_UPDATED') {
-            bus.emit('sw:updateAvailable', {});
-          }
+          if (e.data?.type === 'SW_UPDATED') bus.emit('sw:updateAvailable', {});
         });
       })
       .catch(e => log.warn('Service Worker registration failed:', e));

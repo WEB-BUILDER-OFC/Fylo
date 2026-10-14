@@ -2,6 +2,32 @@ plugins {
     id 'com.android.application'
 }
 
+// ─── Version: ONE source of truth ─────────────────────────────────────────────
+// APP_VERSION in fylo-web/core/constants.js ("MAJOR.MINOR.PATCH") drives versionName AND versionCode, so the
+// native version, the web version shown in Settings, and the service-worker cache name can never drift apart.
+//   versionCode = MAJOR*10000 + MINOR*100 + PATCH   (2.1.0 -> 20100)  — strictly increases with every release
+// Android only treats an APK as an update when versionCode is higher than the installed one, so BUMP
+// APP_VERSION for every release you hand to someone who already has FYLO installed.
+// (Override for CI with -PfyloVersionCode=<int> if you need a build number inside one version.)
+def readFyloVersion() {
+    def f = new File(rootDir, '../fylo-web/core/constants.js')
+    def m = (f.text =~ /APP_VERSION\s*=\s*'(\d+)\.(\d+)\.(\d+)'/)
+    if (!m.find()) throw new GradleException("Cannot read APP_VERSION from ${f}")
+    def code = m.group(1).toInteger() * 10000 + m.group(2).toInteger() * 100 + m.group(3).toInteger()
+    return [name: "${m.group(1)}.${m.group(2)}.${m.group(3)}".toString(), code: code]
+}
+def fyloVersion = readFyloVersion()
+def fyloVersionCode = (project.findProperty('fyloVersionCode') ?: fyloVersion.code).toString().toInteger()
+
+// ─── Optional stable signing key ──────────────────────────────────────────────
+// Android refuses to install an update signed with a DIFFERENT key than the installed app. With no
+// keystore.properties the default debug key (~/.android/debug.keystore) is used exactly as before.
+// To make updates work across machines / CI, create fylo-android/keystore.properties (git-ignored):
+//   storeFile=../fylo-release.jks   storePassword=...   keyAlias=...   keyPassword=...
+def ksFile = rootProject.file('keystore.properties')
+def ksProps = new Properties()
+if (ksFile.exists()) ksFile.withInputStream { ksProps.load(it) }
+
 android {
     namespace 'com.fylo.app'
     compileSdk 34
@@ -10,16 +36,29 @@ android {
         applicationId "com.fylo.app"
         minSdk 26          // Android 8.0 — modern WebView, IndexedDB, ES modules
         targetSdk 34
-        versionCode 1
-        versionName "1.0.0"
+        versionCode fyloVersionCode
+        versionName fyloVersion.name
+    }
+
+    signingConfigs {
+        if (ksFile.exists()) {
+            create('fylo') {
+                storeFile rootProject.file(ksProps['storeFile'])
+                storePassword ksProps['storePassword']
+                keyAlias ksProps['keyAlias']
+                keyPassword ksProps['keyPassword']
+            }
+        }
     }
 
     buildTypes {
         debug {
             debuggable true
-            applicationIdSuffix ".debug"
+            applicationIdSuffix ".debug"      // keep: changing the id would install as a NEW app and strand user data
+            if (ksFile.exists()) signingConfig signingConfigs.fylo
         }
         release {
+            if (ksFile.exists()) signingConfig signingConfigs.fylo
             minifyEnabled false   // Web assets are already optimised; no need to minify Java
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
@@ -70,7 +109,7 @@ configurations.all {
 // This copies the web project into Android assets so the app ships a local copy.
 // The web project lives at ../../fylo-web (two levels up from app/ module directory:
 //   fylo-android/app/ → fylo-android/ → fylo/ → fylo-web/)
-task syncWebAssets(type: Copy) {
+task syncWebAssets(type: Sync) {
     description = 'Copies FYLO web assets into Android assets/www'
     from('../../fylo-web') {
         include 'index.html'
@@ -84,6 +123,11 @@ task syncWebAssets(type: Copy) {
         include 'assets/libs/**'      // local PDF.js/PDF-Lib (downloaded by fetchLibs)
     }
     into 'src/main/assets/www'
+    // Sync (not Copy) deletes files that no longer exist in fylo-web, so a removed/renamed web file can never
+    // linger inside the APK. The PDF libraries are downloaded straight into www/assets/libs, so keep them.
+    preserve {
+        include 'assets/libs/**'
+    }
 }
 
 // ─── Download PDF libraries locally (run once before building) ────────────────
@@ -111,3 +155,17 @@ task fetchPdfLibs(type: Exec) {
 
 // Ensure web assets are synced before assembling
 preBuild.dependsOn syncWebAssets
+
+// Fail the build loudly if the packaged web app is not the same version as the native app.
+task verifyWebVersion {
+    description = 'Fails if assets/www is not in step with APP_VERSION'
+    dependsOn syncWebAssets
+    doLast {
+        def packaged = file('src/main/assets/www/core/constants.js').text
+        if (!(packaged =~ /APP_VERSION\s*=\s*'${java.util.regex.Pattern.quote(fyloVersion.name)}'/)) {
+            throw new GradleException("assets/www/core/constants.js is not APP_VERSION ${fyloVersion.name}")
+        }
+        println "FYLO ${fyloVersion.name} (versionCode ${fyloVersionCode}) — web assets in step"
+    }
+}
+preBuild.dependsOn verifyWebVersion

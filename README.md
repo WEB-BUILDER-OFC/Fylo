@@ -146,14 +146,23 @@ The bridge is exposed as `window.AndroidBridge` inside the WebView.
 
 | Method | Arguments | Returns | Purpose |
 |--------|-----------|---------|---------|
-| `saveFile(base64, filename, mimeType)` | strings | JSON string `{success, path, error}` | Save to Downloads/FYLO |
-| `shareFile(base64, filename, mimeType)` | strings | void | Android share sheet |
-| `requestCameraPermission()` | — | void | Runtime camera permission |
-| `hasCameraPermission()` | — | boolean | Check camera permission |
-| `openFilePicker(mimeTypesCsv)` | string | void | Native file picker |
-| `showToast(message)` | string | void | Native toast |
-| `getPlatform()` | — | "android" | Platform detection |
-| `getAndroidVersion()` | — | string | API level |
+| `saveBegin(kind, subdir, filename, mime)` → `saveChunk(id, base64)` → `saveEnd(id)` | strings | JSON `{ok,…}`; `saveEnd` → `{ok,name,path,uri,bytes}` | **Chunked, size-verified save** to `Download/FYLO[/subdir]` (kind `download`) or `Pictures/FYLO[/subdir]` (kind `image`). `saveEnd` re-reads the stored size and discards the file on mismatch |
+| `saveAbort(id)` | string | void | Discard an unfinished save |
+| `saveFile(base64, filename, mime)` | strings | JSON `{ok,…}` | One-shot variant of the above (small files) |
+| `getFreeSpaceBytes()` | — | number | Free space, for pre-flight checks |
+| `shareUris(jsonArray, mime)` / `viewUri(uri, mime)` | | boolean | Share / open files FYLO saved |
+| `shareFile(base64, filename, mime)` | strings | void | Share a file from bytes |
+| `clearNativeCache()` | — | JSON `{ok,freedBytes}` | Clears WebView HTTP cache + FYLO cache dir only — never IndexedDB, saved files or settings |
+| `getAppInfo()` | — | JSON `{versionName,versionCode,lastUpdateTime,packageName,sdk}` | Shown in Settings → Version |
+| `pickPdfFolder()` → `window.fyloNativeResult('folderPicked', json)` | — | void | SAF folder picker (persisted read grant) |
+| `getPdfFolders()` / `removePdfFolder(uri)` | | JSON / void | Granted folders (`accessible:false` = revoked) |
+| `listPdfs(requestId, treeUri)` → `fyloNativeResult(requestId, json)` / `cancelScan(requestId)` | | void | Background PDF listing (limits: 5000 files, 2500 folders, depth 8, 25 s; reports `truncated`) |
+| `onWebCleanupDone(changed)` / `onWebCleanupFailed(msg)` | | void | Callbacks from the injected post-update cleanup script |
+| `requestCameraPermission()` / `hasCameraPermission()` | | void / boolean | Camera permission |
+| `openFilePicker(mimeTypesCsv)`, `showToast(msg)`, `getPlatform()`, `getAndroidVersion()` | | | as before |
+
+PDFs inside a chosen folder are streamed to the web layer through the WebViewAssetLoader origin at
+`/saf/doc?u=<content-uri>` (only URIs under a folder the user granted are served) — no base64 over the bridge.
 
 **Web → Android result callbacks:**
 
@@ -177,8 +186,8 @@ Nothing else needs to change.
 
 All export/download operations call `downloadBlob(blob, filename)` from `core/ui.js`.
 
-On web: standard `<a>` download.  
-On Android: detected via `window.AndroidBridge !== undefined` → `AndroidBridge.saveFile()`.
+`core/device.js` is the single adapter. On web: standard `<a>` download (cannot be verified — the UI says so).
+On Android: chunked `saveBegin/saveChunk/saveEnd` with native size verification; UI reports the real path or the real error.
 
 ---
 
@@ -205,7 +214,10 @@ On Android: detected via `window.AndroidBridge !== undefined` → `AndroidBridge
 | `CAMERA` | Optional | Document scanning (`getUserMedia`) |
 | `INTERNET` | Optional | CDN fallback if local libs missing |
 
-No broad storage permissions required. MediaStore API is used for Downloads.
+No storage permissions are requested. Saving uses MediaStore (API 29+) or app-specific storage (API 26–28).
+**On Device browsing uses the Storage Access Framework**: the user picks folders; FYLO can only see those folders.
+Android 11+ will not let any app be granted the root of internal storage, `Android/data`, or (on many devices) the
+top-level `Download` folder — pick a folder *inside* it, or `Documents`. FYLO does not claim to see "all PDFs on the phone".
 
 ---
 
@@ -213,7 +225,7 @@ No broad storage permissions required. MediaStore API is used for Downloads.
 
 - WebView only loads `file:///android_asset/www/**` — no arbitrary URLs
 - External URLs open in system browser (not in the WebView)
-- JavaScript bridge exposes only 7 scoped methods — no shell, no FS traversal
+- JavaScript bridge exposes scoped file/SAF methods only — no shell; `/saf/doc` serves only URIs under user-granted folders
 - FileProvider restricts share URIs to app cache only
 - `cleartextTrafficPermitted="false"` in network_security_config.xml
 - No hardcoded keys, secrets, or passwords
@@ -222,33 +234,36 @@ No broad storage permissions required. MediaStore API is used for Downloads.
 
 ## Keeping Web and Android in Sync
 
-When you update the web app:
-
 ```bash
 cd fylo-android
-./gradlew syncWebAssets   # copies latest web files into Android assets
-./gradlew assembleDebug   # builds APK with updated assets
+./gradlew fetchPdfLibs    # once (PDF.js + PDF-Lib into assets/libs)
+./gradlew assembleDebug   # syncWebAssets (a true mirror of fylo-web/) + verifyWebVersion run first
+./scripts/verify-apk.sh   # checks versionName/versionCode and that packaged web files == fylo-web/
 ```
 
-The `syncWebAssets` task runs automatically before every build.
+## Releasing an update that installs over the old one
+
+Android installs an APK as an update only when **(1) `applicationId` is unchanged, (2) `versionCode` is higher, (3) it is signed with the same key.**
+
+1. Bump `APP_VERSION` in `fylo-web/core/constants.js` (e.g. `2.1.0` → `2.1.1`). This is the *only* version source:
+   Gradle derives `versionName` and `versionCode = MAJOR*10000 + MINOR*100 + PATCH`; the Service Worker cache name and Settings → Version use it too.
+2. Build with the **same signing key every time**. Default is the machine's debug key; to make builds from other machines/CI
+   update each other, create `fylo-android/keystore.properties` (git-ignored: `storeFile`, `storePassword`, `keyAlias`, `keyPassword`).
+   If the key ever changes, Android answers `INSTALL_FAILED_UPDATE_INCOMPATIBLE` — back up first (Settings → Export Data), then uninstall once.
+3. `adb install -r app-debug.apk` (or just open the APK on the phone). Data in IndexedDB survives an update.
+
+Why old builds kept showing: a cache-first Service Worker (fixed cache name) and Cache Storage inside the WebView could serve the old app
+shell before any new code ran. Inside the Android wrapper the SW is no longer registered (assets are already local), and after every install/update
+`MainActivity` injects a one-time cleanup (unregister SWs, delete `fylo-*` caches — never IndexedDB) and reloads, retrying until the page confirms.
+Browsers/PWA: the SW cache name is `fylo-v<APP_VERSION>`, so each release replaces the previous cache.
 
 ---
 
-## Device Testing Status
+## Testing status
 
-⚠️  **Physical device / emulator testing was not possible in this build environment.**
+Automated (headless Chromium, `tests/web/` — run `python3 tests/web/make_fixtures.py` then the `*.mjs` suites with Playwright):
+web mode against `fylo-web/`, and an **Android-wrapper simulation** (the `www` copy on the WebViewAssetLoader origin with a *fake* `AndroidBridge`).
+The simulation proves the web layer's handling of the bridge protocol; it does **not** prove real MediaStore/SAF/WebView behaviour.
 
-The following have been validated by code review and architecture audit:
-
-- ✅ Intent filters correctly declared for `application/pdf`
-- ✅ `ACTION_VIEW`, `ACTION_SEND`, `ACTION_SEND_MULTIPLE` handled
-- ✅ content:// URI reading via ContentResolver
-- ✅ MediaStore Downloads save (API 29+)
-- ✅ FileProvider share configuration
-- ✅ Camera permission request/result flow
-- ✅ Back button priority chain
-- ✅ WebView ES module support (minSdk 26 = Chrome 58+ WebView)
-- ✅ PDF library offline loading chain
-- ✅ Web version unaffected (feature-detection guards all Android code)
-
-Physical device testing is required before Play Store submission.
+Not verifiable without a device: MediaStore writes and gallery visibility, the SAF picker and real folder listings, persisted-permission revocation,
+share sheet, Back button, in-place update over an older install, WebView service-worker routing. See the release report for the physical-device checklist.

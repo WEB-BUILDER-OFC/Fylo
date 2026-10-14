@@ -4,4 +4,6 @@
     <cache-path name="shared_cache" path="." />
     <!-- External files dir for larger exports if needed -->
     <external-files-path name="external_files" path="." />
+    <!-- Fallback when external app storage is unavailable (API 26-28 saves) -->
+    <files-path name="internal_files" path="." />
 </paths>

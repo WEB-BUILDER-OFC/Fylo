@@ -9,7 +9,8 @@
     <!-- Internet for CDN library fallback (optional — local libs are preferred) -->
     <uses-permission android:name="android.permission.INTERNET" />
 
-    <!-- No WRITE_EXTERNAL_STORAGE needed on API 29+ with MediaStore -->
+    <!-- No storage permission at all: saves go through MediaStore (API 29+) or app-specific storage (API 26-28),
+         and PDFs on the phone are read from folders the user picks via the Storage Access Framework. -->
 
     <application
         android:name=".FyloApplication"
@@ -69,7 +70,7 @@
         <!-- FileProvider for sharing generated files back to other apps -->
         <provider
             android:name="androidx.core.content.FileProvider"
-            android:authorities="com.fylo.app.fileprovider"
+            android:authorities="${applicationId}.fileprovider"
             android:exported="false"
             android:grantUriPermissions="true">
             <meta-data

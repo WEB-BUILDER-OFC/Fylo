@@ -57,6 +57,12 @@ jobs:
           echo "APK_PATH=$APK" >> $GITHUB_ENV
           echo "APK_SIZE=$SIZE" >> $GITHUB_ENV
 
+      - name: Verify APK version metadata and packaged web assets
+        working-directory: fylo-android
+        run: |
+          export ANDROID_HOME="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          ./scripts/verify-apk.sh app/build/outputs/apk/debug/app-debug.apk
+
       - name: Inspect APK contents (web assets check)
         run: |
           APK=fylo-android/app/build/outputs/apk/debug/app-debug.apk

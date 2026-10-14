@@ -6,6 +6,7 @@
 
 import { TOAST_DURATION_MS } from './constants.js';
 import { bus, EVENTS } from './eventBus.js';
+import { Device } from './device.js';
 
 // ── Toast ─────────────────────────────────────────────────────────────────────
 export function toast(message, duration = TOAST_DURATION_MS) {
@@ -28,13 +29,17 @@ bus.on(EVENTS.APP_TOAST, ({ message, duration }) => toast(message, duration));
 
 // ── Modal ─────────────────────────────────────────────────────────────────────
 let _savedFocus = null;
+let _modalToken = 0;      // identifies the CURRENT modal so a stale close timer can never wipe a newer one
+let _onModalClose = null; // optional callback for the CURRENT modal (cancel a running job when it is dismissed)
 
-export function openModal(title, bodyHTML, footerHTML = '') {
+export function openModal(title, bodyHTML, footerHTML = '', opts = {}) {
   const overlay = document.getElementById('modal-overlay');
   const tEl = document.getElementById('modal-title');
   const bEl = document.getElementById('modal-body');
   const fEl = document.getElementById('modal-footer');
   if (!overlay) return;
+  _modalToken++;
+  _onModalClose = typeof opts.onClose === 'function' ? opts.onClose : null;
   _savedFocus = document.activeElement;
   tEl.textContent = title;
   bEl.innerHTML   = bodyHTML;
@@ -48,9 +53,13 @@ export function openModal(title, bodyHTML, footerHTML = '') {
 export function closeModal() {
   const overlay = document.getElementById('modal-overlay');
   if (!overlay) return;
+  const cb = _onModalClose; _onModalClose = null;
+  if (cb) { try { cb(); } catch (e) { console.error('[ui] modal onClose failed', e); } }
   releaseFocusTrap();
   overlay.classList.remove('show');
+  const token = _modalToken;
   setTimeout(() => {
+    if (token !== _modalToken) return;     // another modal was opened meanwhile — leave it alone
     overlay.classList.add('hidden');
     const bEl = document.getElementById('modal-body');
     const fEl = document.getElementById('modal-footer');
@@ -126,27 +135,54 @@ export function formatDate(ts) {
   return new Date(ts).toLocaleDateString(undefined, { month:'short', day:'numeric', year:'numeric' });
 }
 
+// ── Progress dialog ───────────────────────────────────────────────────────────
+/**
+ * Modal with a real progress bar and a Cancel button. Dismissing it any other way (X, backdrop, Android Back)
+ * also cancels. Returns { signal, update(text, fraction|null), done() }.
+ *   update(text, 0..1)  determinate;  update(text, null)  indeterminate
+ *   done()              closes the dialog WITHOUT triggering cancel
+ */
+export function showProgress(title, { cancelable = true, text = 'Starting…' } = {}) {
+  const ctrl = new AbortController();
+  openModal(title,
+    `<p id="progress-text" style="color:var(--text-secondary);font-size:14px;margin-bottom:12px" aria-live="polite">${text}</p>
+     <div style="height:8px;background:var(--surface-hover);border-radius:9999px;overflow:hidden" role="progressbar" aria-valuemin="0" aria-valuemax="100" id="progress-track">
+       <div id="progress-bar" style="height:100%;width:0%;background:linear-gradient(90deg,var(--primary),var(--accent));transition:width 150ms"></div>
+     </div>`,
+    cancelable ? '<button class="btn btn-secondary" id="progress-cancel">Cancel</button>' : '',
+    { onClose: () => ctrl.abort() });
+  document.getElementById('progress-cancel')?.addEventListener('click', () => closeModal());
+  const api = {
+    signal: ctrl.signal,
+    update(msg, fraction) {
+      const t = document.getElementById('progress-text');
+      const b = document.getElementById('progress-bar');
+      const k = document.getElementById('progress-track');
+      if (t && msg != null) t.textContent = msg;
+      if (b && fraction != null) {
+        const pct = Math.max(0, Math.min(100, Math.round(fraction * 100)));
+        b.style.width = pct + '%';
+        k?.setAttribute('aria-valuenow', String(pct));
+      }
+    },
+    done() { _onModalClose = null; closeModal(); },
+  };
+  return api;
+}
+
 // ── Download helper ───────────────────────────────────────────────────────────
-export function downloadBlob(blob, filename) {
-  // Android WebView: native bridge handles downloads (a.click() is blocked in WebView)
-  if (typeof window.AndroidBridge !== 'undefined') {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const dataUrl = reader.result;
-      const comma   = dataUrl.indexOf(',');
-      const base64  = comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl;
-      window.AndroidBridge.saveFile(base64, filename, blob.type || 'application/pdf');
-    };
-    reader.readAsDataURL(blob);
-    return;
+/**
+ * Saves a Blob for the user. Android: verified save into Download/FYLO via the native bridge (a plain
+ * <a download> click is silently ignored inside WebView). Browser: normal download.
+ * Always resolves to { ok, name, path, uri, bytes, verified } or { ok:false, error } and tells the user either way.
+ */
+export async function downloadBlob(blob, filename, opts = {}) {
+  const r = await Device.saveBlob(blob, filename, opts);
+  if (!opts.quiet) {
+    if (r.ok) toast(r.verified ? `Saved to ${r.path}` : 'Download started');
+    else if (!r.cancelled) toast(`Could not save ${filename}: ${r.error}`, 5000);
   }
-  // Web / PWA: standard anchor download
-  const url = URL.createObjectURL(blob);
-  const a   = document.createElement('a');
-  a.href = url; a.download = filename;
-  document.body.appendChild(a); a.click();
-  document.body.removeChild(a);
-  setTimeout(() => URL.revokeObjectURL(url), 5000);
+  return r;
 }
 
 // ── Misc ──────────────────────────────────────────────────────────────────────

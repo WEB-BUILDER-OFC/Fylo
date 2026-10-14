@@ -4,9 +4,12 @@
  * Cache-first for app files. Network-first for CDN.
  */
 
-// Bump whenever shipped JS/HTML changes so activate() purges the previous app shell.
-// v4 purged the pre-router-fix shell; v6 ships the reader sharpness/full-screen, scan-to-PDF workflow changes (v5: camera/permission, Manage, debug-overlay removal).
-const CACHE_NAME = 'fylo-v6';
+// The cache name comes from the registration URL (app.js registers './sw.js?v=' + APP_VERSION).
+// A new APP_VERSION => a different script URL => the browser installs a new worker, which caches under a new
+// name and purges the old ones. No hand-edited constant to forget. (Not used inside the Android app, which
+// ships its files in the APK and does not register a service worker at all.)
+const SW_VERSION = new URL(self.location.href).searchParams.get('v') || 'dev';
+const CACHE_NAME = 'fylo-v' + SW_VERSION;
 
 const STATIC_ASSETS = [
   './',
@@ -22,6 +25,8 @@ const STATIC_ASSETS = [
   './core/router.js',
   './core/ui.js',
   './core/libs.js',
+  './core/device.js',
+  './core/zip.js',
   // Feature entry points
   './features/reader/index.js',
   './features/editor/index.js',
@@ -29,6 +34,7 @@ const STATIC_ASSETS = [
   './features/tools/index.js',
   './features/files/index.js',
   './features/settings/index.js',
+  './features/menu/index.js',
   // Feature implementations
   './features/reader/reader.js',
   './features/reader/gestures.js',
@@ -37,6 +43,10 @@ const STATIC_ASSETS = [
   './features/tools/tools.js',
   './features/files/files.js',
   './features/settings/settings.js',
+  './features/settings/backup.js',
+  './features/menu/menu.js',
+  './features/files/ondevice.js',
+  './features/tools/pdfcompress.js',
   // Assets
   './assets/css/main.css',
   './assets/icons/icon-192.png',
@@ -57,7 +67,7 @@ self.addEventListener('activate', e => {
   e.waitUntil(
     caches.keys()
       .then(keys => {
-        const stale = keys.filter(k => k !== CACHE_NAME);
+        const stale = keys.filter(k => k !== CACHE_NAME && k.startsWith('fylo-'));
         replacedOlderVersion = stale.length > 0;
         return Promise.all(stale.map(k => caches.delete(k)));
       })

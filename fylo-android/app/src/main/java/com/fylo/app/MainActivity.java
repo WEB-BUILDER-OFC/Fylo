@@ -3,12 +3,15 @@ package com.fylo.app;
 import android.Manifest;
 import android.content.ClipData;
 import android.content.ContentResolver;
+import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
+import android.content.res.AssetFileDescriptor;
 import android.net.Uri;
 import android.os.Bundle;
-import android.os.Environment;
+import android.os.StatFs;
 import android.util.Base64;
 import android.util.Log;
 import android.webkit.JavascriptInterface;
@@ -38,13 +41,17 @@ import androidx.webkit.WebViewClientCompat;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.InputStream;
-import java.io.OutputStream;
 import java.util.ArrayList;
-import java.util.List;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * FYLO — MainActivity
@@ -77,12 +84,23 @@ public class MainActivity extends AppCompatActivity {
             "https://" + ASSET_HOST + "/assets/www/";
 
     private WebView mWebView;
-    // One-time (per APK install/update) cleanup of service workers left by an older build.
-    // Previously this ran — and force-reloaded the page — on EVERY launch.
-    private boolean mNeedSwCheck = false;
+
+    // ── Upgrade hygiene ───────────────────────────────────────────────────────
+    // A service worker / Cache Storage entry created by an older build can keep serving the OLD web app
+    // from cache even though the APK now bundles a newer one (the page is stale before any new code runs,
+    // so only native code can fix it). After every install/update we therefore run a cleanup in the page and
+    // only record it as done when the page confirms it (AndroidBridge.onWebCleanupDone). If the confirmation
+    // never arrives (cleanup threw, WebView too old …) it is simply tried again on the next launch.
+    private volatile boolean mNeedWebCleanup = false;
+    private volatile boolean mReloadedForCleanup = false;     // loop guard: at most one forced reload per process
     private static final String PREFS = "fylo_native";
-    private static final String PREF_SW_CLEANED = "sw_cleaned_for_install";
+    private static final String PREF_WEB_CLEANED = "web_cleanup_stamp";
     private static int sRendererCrashCount = 0;
+
+    // File saving (verified, chunked) and Storage Access Framework PDF browsing.
+    private FileSaver mSaver;
+    private SafPdfIndex mSaf;
+    private final Map<String, AtomicBoolean> mScans = new ConcurrentHashMap<>();
 
 
     // Pending intent data (PDF opened from file manager / share)
@@ -115,6 +133,23 @@ public class MainActivity extends AppCompatActivity {
                 mFileChooserCallback = null;
             });
 
+    // Folder picker (Storage Access Framework). Requests a READ grant that can be persisted so the
+    // folder is still available after the app restarts.
+    private static final class PersistableTreeContract extends ActivityResultContracts.OpenDocumentTree {
+        @NonNull
+        @Override
+        public Intent createIntent(@NonNull Context context, Uri input) {
+            Intent i = super.createIntent(context, input);
+            i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+                    | Intent.FLAG_GRANT_PREFIX_URI_PERMISSION);
+            return i;
+        }
+    }
+
+    private final ActivityResultLauncher<Uri> mFolderPicker =
+        registerForActivityResult(new PersistableTreeContract(), this::onFolderPicked);
+
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     @Override
@@ -122,8 +157,11 @@ public class MainActivity extends AppCompatActivity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
-        mNeedSwCheck = getSharedPreferences(PREFS, MODE_PRIVATE)
-                .getLong(PREF_SW_CLEANED, -1L) != installStamp();
+        mSaver = new FileSaver(this);
+        mSaf = new SafPdfIndex(this);
+
+        mNeedWebCleanup = !installStamp().equals(
+                getSharedPreferences(PREFS, MODE_PRIVATE).getString(PREF_WEB_CLEANED, ""));
 
         mWebView = findViewById(R.id.webview);
         setupWebView();
@@ -131,6 +169,13 @@ public class MainActivity extends AppCompatActivity {
 
         // Store intent for delivery after app loads
         mPendingIntent = getIntent();
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (mSaver != null) mSaver.abortAll();          // never leave half-written files behind
+        for (AtomicBoolean cancel : mScans.values()) cancel.set(true);
+        super.onDestroy();
     }
 
     @Override
@@ -195,6 +240,12 @@ public class MainActivity extends AppCompatActivity {
             @Override
             public WebResourceResponse shouldInterceptRequest(
                     WebView view, WebResourceRequest request) {
+                // PDFs from folders the user granted via the Storage Access Framework are streamed straight
+                // to the page (fetch → Blob) instead of being base64-encoded through the JS bridge.
+                Uri reqUri = request.getUrl();
+                if (ASSET_HOST.equals(reqUri.getHost()) && "/saf/doc".equals(reqUri.getPath())) {
+                    return serveSafDocument(reqUri);
+                }
                 WebResourceResponse response =
                         assetLoader.shouldInterceptRequest(request.getUrl());
                 if (response != null) {
@@ -248,16 +299,24 @@ public class MainActivity extends AppCompatActivity {
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
                 sRendererCrashCount = 0;
-                if (mNeedSwCheck) {
-                    mNeedSwCheck = false;
-                    getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-                            .putLong(PREF_SW_CLEANED, installStamp()).apply();
-                    String swJS = "(function(){if(!('serviceWorker' in navigator))return;"
-                        + "navigator.serviceWorker.getRegistrations().then(function(rs){"
-                        + "if(!rs.length)return;"
-                        + "Promise.all(rs.map(function(r){return r.unregister();})).then(function(){window.location.reload(true);});"
-                        + "});})();";
-                    view.evaluateJavascript(swJS, null);
+                if (mNeedWebCleanup) {
+                    // Runs inside the page. The result comes back through AndroidBridge.onWebCleanupDone().
+                    // Only FYLO's own caches ("fylo-*") are touched — never IndexedDB, files, bookmarks or settings.
+                    view.evaluateJavascript(
+                        "(async function(){"
+                        + "try{"
+                        + "var changed=false;"
+                        + "if('serviceWorker' in navigator){"
+                        +   "var rs=await navigator.serviceWorker.getRegistrations();"
+                        +   "for(var i=0;i<rs.length;i++){ if(await rs[i].unregister()) changed=true; }"
+                        + "}"
+                        + "if(window.caches){"
+                        +   "var ks=await caches.keys();"
+                        +   "for(var j=0;j<ks.length;j++){ if(ks[j].indexOf('fylo-')===0){ await caches.delete(ks[j]); changed=true; } }"
+                        + "}"
+                        + "AndroidBridge.onWebCleanupDone(changed);"
+                        + "}catch(e){ AndroidBridge.onWebCleanupFailed(String(e&&e.message||e)); }"
+                        + "})();", null);
                 }
                 if (mPendingIntent != null) {
                     final Intent intent = mPendingIntent;
@@ -348,13 +407,77 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    /** Changes whenever the APK is installed or updated. */
-    private long installStamp() {
+    /**
+     * Identifies the installed build. Changes on every update (versionCode) and on every re-install of the
+     * same version (lastUpdateTime), so stale web caches are never trusted across either.
+     */
+    private String installStamp() {
         try {
-            return getPackageManager().getPackageInfo(getPackageName(), 0).lastUpdateTime;
+            PackageInfo p = getPackageManager().getPackageInfo(getPackageName(), 0);
+            return p.versionCode + ":" + p.lastUpdateTime;
         } catch (Exception e) {
-            return -1L;
+            return "unknown";
         }
+    }
+
+    /** Only URIs FYLO created itself (MediaStore items it inserted, or its FileProvider) may be shared/opened. */
+    private boolean isOwnSavedUri(Uri u) {
+        if (u == null || !"content".equals(u.getScheme())) return false;
+        String a = u.getAuthority();
+        return "media".equals(a) || (getPackageName() + ".fileprovider").equals(a);
+    }
+
+    /** Serves a document from a user-granted folder to the page; 403 for anything outside those folders. */
+    private WebResourceResponse serveSafDocument(Uri req) {
+        try {
+            String s = req.getQueryParameter("u");
+            if (s == null || s.isEmpty()) return httpError(400, "Bad Request");
+            Uri doc = Uri.parse(s);
+            if (!mSaf.isUnderGrantedRoot(doc)) return httpError(403, "Forbidden");
+            AssetFileDescriptor afd = getContentResolver().openAssetFileDescriptor(doc, "r");
+            if (afd == null) return httpError(404, "Not Found");
+            Map<String, String> headers = new HashMap<>();
+            headers.put("Cache-Control", "no-store");
+            long len = afd.getLength();
+            if (len >= 0) headers.put("Content-Length", Long.toString(len));
+            return new WebResourceResponse("application/pdf", null, 200, "OK", headers, afd.createInputStream());
+        } catch (SecurityException e) {
+            return httpError(403, "Forbidden");
+        } catch (FileNotFoundException e) {
+            return httpError(404, "Not Found");
+        } catch (Exception e) {
+            Log.e(TAG, "serveSafDocument failed", e);
+            return httpError(500, "Read Error");
+        }
+    }
+
+    private static WebResourceResponse httpError(int code, String reason) {
+        return new WebResourceResponse("text/plain", "utf-8", code, reason,
+                new HashMap<String, String>(), new ByteArrayInputStream(new byte[0]));
+    }
+
+    /** Delivers a native result to the page: window.fyloNativeResult(id, jsonString). */
+    private void postToWeb(String id, String json) {
+        final String js = "window.fyloNativeResult&&window.fyloNativeResult("
+                + JSONObject.quote(id) + "," + JSONObject.quote(json) + ")";
+        runOnUiThread(() -> { if (mWebView != null) mWebView.evaluateJavascript(js, null); });
+    }
+
+    /** Result of the folder picker. */
+    private void onFolderPicked(Uri tree) {
+        String json;
+        try {
+            if (tree == null) {
+                json = FileSaver.json("ok", false, "cancelled", true);
+            } else {
+                JSONObject folder = mSaf.addRoot(tree);
+                json = FileSaver.json("ok", true, "folder", folder);
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "onFolderPicked failed", e);
+            json = FileSaver.json("ok", false, "error", FileSaver.describe(e));
+        }
+        postToWeb("folderPicked", json);
     }
 
     // ── Camera permission ─────────────────────────────────────────────────────
@@ -541,89 +664,122 @@ public class MainActivity extends AppCompatActivity {
      */
     private class FyloBridge {
 
-        /**
-         * Save a base64-encoded file to the user's Downloads.
-         * Called by the web layer for all download/export operations.
-         *
-         * @param base64   Base64-encoded file content (no data-URI prefix)
-         * @param filename Target filename (no path — basename only)
-         * @param mimeType MIME type string
-         * @return JSON {success:bool, path:string, error:string}
-         */
+        // ── App / update info ─────────────────────────────────────────────────
+
+        /** {versionName, versionCode, lastUpdateTime, packageName, sdk} — shows which build is really running. */
+        @JavascriptInterface
+        public String getAppInfo() {
+            try {
+                PackageInfo p = getPackageManager().getPackageInfo(getPackageName(), 0);
+                return FileSaver.json("versionName", p.versionName, "versionCode", p.versionCode,
+                        "lastUpdateTime", p.lastUpdateTime, "packageName", getPackageName(),
+                        "sdk", android.os.Build.VERSION.SDK_INT);
+            } catch (Exception e) {
+                return FileSaver.json("error", FileSaver.describe(e));
+            }
+        }
+
+        /** Called by the cleanup script injected after an install/update (see onPageFinished). */
+        @JavascriptInterface
+        public void onWebCleanupDone(boolean changed) {
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(PREF_WEB_CLEANED, installStamp()).apply();
+            mNeedWebCleanup = false;
+            if (changed && !mReloadedForCleanup) {
+                // Stale caches were just removed: reload so the page is served from the APK's assets.
+                mReloadedForCleanup = true;
+                runOnUiThread(() -> {
+                    mWebView.clearCache(true);
+                    mWebView.reload();
+                });
+            }
+        }
+
+        @JavascriptInterface
+        public void onWebCleanupFailed(String reason) {
+            Log.w(TAG, "Web cleanup failed (will be retried on next launch): " + reason);
+        }
+
+        // ── Saving files (chunked + verified; see FileSaver) ──────────────────
+
+        /** kind: "download" (Download/FYLO) or "image" (Pictures/FYLO). Returns {ok, id} or {ok:false, error}. */
+        @JavascriptInterface
+        public String saveBegin(String kind, String subdir, String filename, String mimeType) {
+            return mSaver.begin(kind, subdir, filename, mimeType);
+        }
+
+        @JavascriptInterface
+        public String saveChunk(String id, String base64) {
+            return mSaver.chunk(id, base64);
+        }
+
+        /** Returns {ok, name, path, uri, bytes}; ok is true only after the written size was read back and matched. */
+        @JavascriptInterface
+        public String saveEnd(String id) {
+            return mSaver.end(id);
+        }
+
+        @JavascriptInterface
+        public void saveAbort(String id) {
+            mSaver.abort(id);
+        }
+
+        /** One-shot save for small files. Same verification and result format as saveEnd. */
         @JavascriptInterface
         public String saveFile(String base64, String filename, String mimeType) {
             try {
-                // Sanitise filename — strip any path components
-                String safeName = new File(filename).getName();
-                if (safeName.isEmpty() || safeName.equals(".")) safeName = "fylo-export.pdf";
-                // Block path traversal
-                if (safeName.contains("/") || safeName.contains("\\") || safeName.contains("..")) {
-                    return "{\"success\":false,\"error\":\"Invalid filename\"}";
-                }
-
                 byte[] bytes = Base64.decode(base64, Base64.DEFAULT);
-
-                // Save to app cache first, then copy to Downloads via MediaStore (API 29+)
-                File cacheFile = new File(getCacheDir(), safeName);
-                try (FileOutputStream fos = new FileOutputStream(cacheFile)) {
-                    fos.write(bytes);
-                }
-
-                // MediaStore insertion for Downloads visibility
-                android.content.ContentValues values = new android.content.ContentValues();
-                values.put(android.provider.MediaStore.Downloads.DISPLAY_NAME, safeName);
-                values.put(android.provider.MediaStore.Downloads.MIME_TYPE,
-                        mimeType != null && !mimeType.isEmpty() ? mimeType : "application/pdf");
-                values.put(android.provider.MediaStore.Downloads.RELATIVE_PATH,
-                        Environment.DIRECTORY_DOWNLOADS + "/FYLO");
-                values.put(android.provider.MediaStore.Downloads.IS_PENDING, 1);
-
-                Uri collection = android.provider.MediaStore.Downloads.getContentUri(
-                        android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY);
-                Uri itemUri = getContentResolver().insert(collection, values);
-
-                if (itemUri != null) {
-                    try (OutputStream os = getContentResolver().openOutputStream(itemUri)) {
-                        if (os != null) os.write(bytes);
-                    }
-                    values.clear();
-                    values.put(android.provider.MediaStore.Downloads.IS_PENDING, 0);
-                    getContentResolver().update(itemUri, values, null, null);
-                }
-
-                cacheFile.delete();
-
-                // savedName is effectively final — required for lambda capture.
-                // safeName may have been reassigned above (default name fallback),
-                // so we snapshot it here after all mutation is complete.
-                final String savedName = safeName;
-                runOnUiThread(() ->
-                    Toast.makeText(MainActivity.this,
-                        "Saved: " + savedName, Toast.LENGTH_SHORT).show());
-
-                return "{\"success\":true,\"path\":\"Downloads/FYLO/" + safeName + "\"}";
-
+                return mSaver.saveAll(bytes, "download", "", filename, mimeType);
             } catch (Exception e) {
                 Log.e(TAG, "saveFile error", e);
-                return "{\"success\":false,\"error\":\"" + e.getMessage() + "\"}";
+                return FileSaver.json("ok", false, "error", FileSaver.describe(e));
+            }
+        }
+
+        /** Free bytes on the app's storage volume, or -1 if unknown. Used to refuse exports that cannot fit. */
+        @JavascriptInterface
+        public long getFreeSpaceBytes() {
+            try {
+                return new StatFs(getFilesDir().getAbsolutePath()).getAvailableBytes();
+            } catch (Exception e) {
+                return -1L;
             }
         }
 
         /**
-         * Share a file with other Android apps.
-         * Creates a FileProvider URI and launches the share sheet.
+         * Removes disposable data only: temporary share files in the app cache and the WebView's HTTP cache.
+         * Never touches IndexedDB (PDFs, bookmarks, settings), files saved to Downloads/Pictures, or folder grants.
          */
+        @JavascriptInterface
+        public String clearNativeCache() {
+            long freed = 0L;
+            File[] files = getCacheDir().listFiles();
+            if (files != null) {
+                for (File f : files) {
+                    // Only plain files: sub-directories belong to the WebView's own disk cache.
+                    if (f.isFile()) {
+                        long len = f.length();
+                        if (f.delete()) freed += len;
+                    }
+                }
+            }
+            runOnUiThread(() -> { if (mWebView != null) mWebView.clearCache(true); });
+            return FileSaver.json("ok", true, "freedBytes", freed);
+        }
+
+        // ── Sharing / viewing saved results ───────────────────────────────────
+
+        /** Share a file the page just generated (written to the app cache, handed over via FileProvider). */
         @JavascriptInterface
         public void shareFile(String base64, String filename, String mimeType) {
             try {
-                String safeName = new File(filename).getName();
+                String safeName = FileSaver.safeName(filename, "fylo-share.pdf");
                 byte[] bytes = Base64.decode(base64, Base64.DEFAULT);
                 File shareFile = new File(getCacheDir(), safeName);
                 try (FileOutputStream fos = new FileOutputStream(shareFile)) {
                     fos.write(bytes);
                 }
                 Uri shareUri = FileProvider.getUriForFile(
-                    MainActivity.this, "com.fylo.app.fileprovider", shareFile);
+                    MainActivity.this, getPackageName() + ".fileprovider", shareFile);
 
                 Intent shareIntent = new Intent(Intent.ACTION_SEND);
                 shareIntent.setType(mimeType != null ? mimeType : "application/pdf");
@@ -635,6 +791,103 @@ public class MainActivity extends AppCompatActivity {
             } catch (Exception e) {
                 Log.e(TAG, "shareFile error", e);
             }
+        }
+
+        /** Share files FYLO itself saved (URIs returned by saveEnd). Returns false if nothing could be shared. */
+        @JavascriptInterface
+        public boolean shareUris(String jsonArray, String mimeType) {
+            try {
+                JSONArray arr = new JSONArray(jsonArray);
+                ArrayList<Uri> uris = new ArrayList<>();
+                for (int i = 0; i < arr.length(); i++) {
+                    Uri u = Uri.parse(arr.getString(i));
+                    if (isOwnSavedUri(u)) uris.add(u);
+                }
+                if (uris.isEmpty()) return false;
+                final Intent send = new Intent(uris.size() == 1 ? Intent.ACTION_SEND : Intent.ACTION_SEND_MULTIPLE);
+                send.setType(mimeType != null && !mimeType.isEmpty() ? mimeType : "*/*");
+                if (uris.size() == 1) {
+                    send.putExtra(Intent.EXTRA_STREAM, uris.get(0));
+                } else {
+                    send.putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris);
+                }
+                ClipData clip = ClipData.newRawUri("FYLO", uris.get(0));
+                for (int i = 1; i < uris.size(); i++) clip.addItem(new ClipData.Item(uris.get(i)));
+                send.setClipData(clip);
+                send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                runOnUiThread(() -> startActivity(Intent.createChooser(send, "Share via")));
+                return true;
+            } catch (Exception e) {
+                Log.e(TAG, "shareUris error", e);
+                return false;
+            }
+        }
+
+        /** Open a file FYLO saved in another app (e.g. Gallery for an image). Returns false if no app can open it. */
+        @JavascriptInterface
+        public boolean viewUri(String uri, String mimeType) {
+            try {
+                Uri u = Uri.parse(uri);
+                if (!isOwnSavedUri(u)) return false;
+                final Intent view = new Intent(Intent.ACTION_VIEW);
+                view.setDataAndType(u, mimeType != null && !mimeType.isEmpty() ? mimeType : "*/*");
+                view.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                if (view.resolveActivity(getPackageManager()) == null) return false;
+                runOnUiThread(() -> startActivity(view));
+                return true;
+            } catch (Exception e) {
+                Log.e(TAG, "viewUri error", e);
+                return false;
+            }
+        }
+
+        // ── On-device PDF browsing (Storage Access Framework) ─────────────────
+
+        /** Opens the system folder picker. Result: window.fyloNativeResult("folderPicked", json). */
+        @JavascriptInterface
+        public void pickPdfFolder() {
+            runOnUiThread(() -> {
+                try {
+                    mFolderPicker.launch(null);
+                } catch (Exception e) {
+                    postToWeb("folderPicked", FileSaver.json("ok", false, "error", FileSaver.describe(e)));
+                }
+            });
+        }
+
+        /** JSON array of {uri, name, accessible} for the folders the user granted. */
+        @JavascriptInterface
+        public String getPdfFolders() {
+            return mSaf.foldersJson().toString();
+        }
+
+        @JavascriptInterface
+        public void removePdfFolder(String treeUri) {
+            if (treeUri != null) mSaf.removeRoot(treeUri);
+        }
+
+        /** Lists PDFs under a granted folder in the background. Result: window.fyloNativeResult(requestId, json). */
+        @JavascriptInterface
+        public void listPdfs(final String requestId, final String treeUri) {
+            if (requestId == null || treeUri == null) return;
+            final AtomicBoolean cancel = new AtomicBoolean(false);
+            mScans.put(requestId, cancel);
+            new Thread(() -> {
+                String json;
+                try {
+                    json = mSaf.listPdfs(Uri.parse(treeUri), cancel).toString();
+                } catch (Exception e) {
+                    json = FileSaver.json("ok", false, "error", "ERROR", "message", FileSaver.describe(e));
+                }
+                mScans.remove(requestId);
+                postToWeb(requestId, json);
+            }, "fylo-pdf-scan").start();
+        }
+
+        @JavascriptInterface
+        public void cancelScan(String requestId) {
+            AtomicBoolean c = requestId == null ? null : mScans.get(requestId);
+            if (c != null) c.set(true);
         }
 
         /**

@@ -18,6 +18,7 @@ import {
   formatFileSize, formatDate, generateId, ripple, downloadBlob, $
 } from '../../core/ui.js';
 import { createLogger } from '../../core/logger.js';
+import './ondevice.js';          // registers the On Device tab (bus: ondevice:show / ondevice:manageFolders)
 
 const log = createLogger('Files');
 
@@ -186,6 +187,19 @@ function renderRecent() {
 
 function renderFiles(filteredFiles) {
   const tab       = document.querySelector('.file-tab.active')?.dataset.tab || 'recent';
+  // "On Device" is a separate panel (features/files/ondevice.js); the library list/empty state hide while it shows.
+  const odPanel = document.getElementById('ondevice-panel');
+  if (odPanel) {
+    const onDevice = tab === 'device';
+    const wasHidden = odPanel.classList.contains('hidden');
+    odPanel.classList.toggle('hidden', !onDevice);
+    if (onDevice) {
+      document.getElementById('files-empty')?.classList.add('hidden');
+      document.getElementById('files-list')?.classList.add('hidden');
+      if (wasHidden) bus.emit('ondevice:show', {});
+      return;
+    }
+  }
   let files       = filteredFiles ?? (
     tab === 'favorites' ? State.files.filter(f => State.isFavorite(f.id)) :
     tab === 'offline'   ? State.files.filter(f => f.offline) :
@@ -244,13 +258,19 @@ function renderFiles(filteredFiles) {
 }
 
 // ── Wire file tabs ───────────────────────────────────────────────────────────
+function selectTab(name) {
+  const tab = document.querySelector(`.file-tab[data-tab="${name}"]`);
+  if (!tab || tab.classList.contains('hidden')) return;
+  document.querySelectorAll('.file-tab').forEach(t => t.classList.remove('active'));
+  tab.classList.add('active');
+  renderFiles();
+}
+let _tabsWired = false;
 function wireFileTabs() {
+  if (_tabsWired) return;           // listeners are attached exactly once
+  _tabsWired = true;
   document.querySelectorAll('.file-tab').forEach(tab => {
-    tab.addEventListener('click', () => {
-      document.querySelectorAll('.file-tab').forEach(t => t.classList.remove('active'));
-      tab.classList.add('active');
-      renderFiles();
-    });
+    tab.addEventListener('click', () => selectTab(tab.dataset.tab));
   });
 }
 
@@ -271,5 +291,6 @@ bus.on('files:incoming',      ({ files, onSaved, requirePersist })  => {
   handleFiles(files, { requirePersist }).then(ids => onSaved?.(ids)).catch(e => { log.error('files:incoming failed:', e); onSaved?.([]); });
 });
 bus.on('files:render',        ()                    => renderFiles());
+bus.on('files:selectTab',     ({ tab })             => selectTab(tab));
 bus.on('files:renderFiltered',({ files })           => renderFiles(files));
 bus.on('files:updateStorage', ()                    => updateStorage());

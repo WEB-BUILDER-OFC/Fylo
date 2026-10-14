@@ -5,7 +5,9 @@
  */
 
 export const APP_NAME    = 'FYLO';
-export const APP_VERSION = '2.0.0';
+// Single source of truth for the release version. fylo-android/app/build.gradle reads THIS line to derive
+// versionName and versionCode, and the service worker takes its cache name from it — bump it for every release.
+export const APP_VERSION = '2.1.0';
 
 // PDF library versions
 export const PDFJS_VERSION  = '3.11.174';
@@ -43,6 +45,9 @@ export const EDITOR_PALETTE = [
   '#FFB300','#FF5252','#4F8CFF','#00C853','#7B61FF','#FF6D00',
   '#00B0FF','#FF4081','#69F0AE','#EEFF41','#111111','#FFFFFF',
 ];
+
+// Compression levels offered by the Compress tool (see features/tools/pdfcompress.js)
+export const COMPRESS_LEVELS = ['low', 'medium', 'high'];
 
 // Storage limits
 export const STORAGE_LIMIT_BYTES = 500 * 1024 * 1024; // 500 MB

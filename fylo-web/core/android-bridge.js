@@ -28,6 +28,7 @@ export const isAndroid = typeof window.AndroidBridge !== 'undefined';
  *
  * Blob → base64 → AndroidBridge.saveFile() → MediaStore / Downloads
  */
+// NOTE: superseded by Device.saveBlob() in core/device.js (chunked + verified). Kept only so older imports don't break.
 export function androidDownloadBlob(blob, filename) {
   const reader = new FileReader();
   reader.onload = () => {
@@ -90,6 +91,12 @@ export function androidRequestCamera() {
  */
 export function installBackHandler() {
   window.fyloHandleBack = () => {
+    // 0. Close the menu drawer
+    const drawer = document.getElementById('menu-drawer');
+    if (drawer && drawer.classList.contains('open')) {
+      bus.emit('menu:closeRequest', {});
+      return true;
+    }
     // 1. Close open modal
     const overlay = document.getElementById('modal-overlay');
     if (overlay && !overlay.classList.contains('hidden')) {

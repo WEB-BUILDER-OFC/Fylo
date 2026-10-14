@@ -24,6 +24,8 @@ const _state = {
     reduceMotion:  false,
     storageLimit:  STORAGE_LIMIT_BYTES,
     defaultTool:   'select',
+    compressLevel: 'medium',   // default for the Compress tool: low | medium | high
+    imageFormat:   'png',      // default for PDF to Image: png | jpg
     language:      'en',
   },
   db:           null,

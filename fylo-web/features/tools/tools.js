@@ -12,9 +12,11 @@ import { Libs }          from '../../core/libs.js';
 import { Router }        from '../../core/router.js';
 import { PAGES }         from '../../core/constants.js';
 import {
-  toast, downloadBlob, openModal, closeModal,
+  toast, downloadBlob, openModal, closeModal, showProgress,
   formatFileSize, generateId, $
 } from '../../core/ui.js';
+import { Device }        from '../../core/device.js';
+import { compressPdf, LEVELS } from './pdfcompress.js';
 import { FileStorage }   from '../../core/storage.js';
 import { createLogger }  from '../../core/logger.js';
 
@@ -199,6 +201,24 @@ async function _renderPageGrid(blob, mode, opts = {}) {
   return grid;
 }
 
+// ── Result dialog ────────────────────────────────────────────────────────────
+// actions: [{ label, primary?, onClick?() }] — every action closes the dialog first.
+function showResult(title, bodyHTML, actions = [{ label: 'Done', primary: true }]) {
+  openModal(title, bodyHTML,
+    actions.map((a, i) => `<button class="btn ${a.primary ? 'btn-primary' : 'btn-secondary'}" data-result-action="${i}">${esc(a.label)}</button>`).join(''));
+  document.querySelectorAll('[data-result-action]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const a = actions[Number(btn.dataset.resultAction)];
+      closeModal();
+      a?.onClick?.();
+    });
+  });
+}
+
+function bullets(items) {
+  return `<ul style="margin:8px 0 0 18px;color:var(--text-secondary);font-size:13px;line-height:1.6">${items.map(i => `<li>${i}</li>`).join('')}</ul>`;
+}
+
 // ============================================================
 //  TOOL IMPLEMENTATIONS
 // ============================================================
@@ -335,20 +355,78 @@ async function toolReorder(file, newOrder) {
 }
 
 // ── COMPRESS ──────────────────────────────────────────────────
-async function toolCompress(file) {
+// Flow: pick file → compressPdf() (real image recompression + verification) → only if clearly smaller AND verified:
+// import into the FYLO library (and wait until it is actually stored) → result dialog with Open / Save to device.
+// The source file is never modified.
+function describeImages(r) {
+  const im = r.images;
+  const out = [];
+  if (im.found === 0) out.push('No embedded images — this PDF is text/vector content, which is already compact.');
+  else {
+    out.push(`Images recompressed: ${im.recompressed} of ${im.found}` + (im.kept ? ` (${im.kept} already efficient, kept as they were)` : ''));
+    const sk = Object.entries(im.skipped).filter(([k]) => k !== 'tiny' && k !== 'not-image');
+    if (sk.length) out.push('Left unchanged: ' + sk.map(([k, n]) => `${n} × ${esc(k)}`).join(', '));
+  }
+  if (r.streamsDeflated) out.push(`${r.streamsDeflated} uncompressed data streams compressed.`);
+  return out;
+}
+
+async function toolCompress(file, levelKey = State.settings.compressLevel || 'medium') {
   if (!file) { toast('Select a PDF'); return; }
-  toast('Compressing PDF…');
+  if (!file.blob) { toast('File data unavailable'); return; }
+  const prog = showProgress('Compressing PDF', { text: 'Reading the PDF…' });
+  let r;
   try {
-    if (!await Libs.waitForPdfLib()) { toast('PDF-Lib not loaded.'); return; }
-    const { PDFDocument } = Libs.pdflib;
-    const ab  = await file.blob.arrayBuffer();
-    const pdf = await PDFDocument.load(ab, { updateMetadata: false });
-    const bytes = await pdf.save({ useObjectStreams: true });
-    const blob  = new Blob([bytes], { type: 'application/pdf' });
-    const saved = ((file.size - blob.size) / file.size * 100).toFixed(1);
-    downloadBlob(blob, file.name.replace(/\.pdf$/i, '_compressed.pdf'));
-    toast(`Compressed — saved ~${saved}% (${fmtBytes(file.size)} → ${fmtBytes(blob.size)})`);
-  } catch(e) { log.error('Compress failed:', e); toast('Compress failed: ' + e.message); }
+    const ab = await file.blob.arrayBuffer();
+    r = await compressPdf(ab, {
+      level: levelKey, signal: prog.signal,
+      onProgress: p => prog.update(p.message, p.fraction),
+    });
+  } catch (e) {
+    prog.done();
+    if (e?.name === 'AbortError') { toast('Compression cancelled — your original is unchanged'); return; }
+    log.error('Compress failed:', e);
+    showResult('Compression failed', `<p>Something went wrong while compressing <strong>${esc(file.name)}</strong>: ${esc(e?.message || e)}</p><p style="margin-top:8px;color:var(--text-tertiary);font-size:13px">Your original file is unchanged.</p>`);
+    return;
+  }
+  prog.done();
+
+  // Hard failures: encrypted, malformed, too large, verification failed …
+  if (!r.ok) {
+    showResult(r.code === 'VERIFY_FAILED' ? 'Compression discarded' : 'Couldn’t compress',
+      `<p>${esc(r.message)}</p>` + (r.checks?.length ? bullets(r.checks.map(esc)) : ''));
+    return;
+  }
+
+  // Nothing worth keeping → say so; do NOT present a file as a size reduction.
+  if (!r.reduced) {
+    const grew = r.newSize > r.originalSize;
+    showResult('Couldn’t make it smaller',
+      `<p><strong>${esc(file.name)}</strong> is already well compressed. Best result: ${fmtBytes(r.originalSize)} → ${fmtBytes(r.newSize)}${grew ? ' (larger, so it was not kept)' : ' (a negligible change, so it was not kept)'}.</p>`
+      + bullets(describeImages(r).map(x => x))
+      + `<p style="margin-top:10px;color:var(--text-tertiary);font-size:13px">No new file was created and your original is unchanged.${levelKey !== 'high' ? ' You can also try the Maximum level.' : ''}</p>`);
+    return;
+  }
+
+  // Verified and smaller → store in the library, confirm it is really there.
+  const outName = file.name.replace(/\.pdf$/i, '') + '_compressed.pdf';
+  const blob = new Blob([r.bytes], { type: 'application/pdf' });
+  const saved = await new Promise(resolve => {
+    bus.emit('files:incoming', { files: [new File([blob], outName, { type: 'application/pdf' })], onSaved: ids => resolve(ids || []) });
+  });
+  const stored = saved.length > 0;
+  const pct = ((1 - r.newSize / r.originalSize) * 100).toFixed(1);
+  const checkList = (r.checks || []).map(c => '✓ ' + esc(c));
+  showResult('PDF compressed',
+    `<p style="font-size:15px"><strong>${fmtBytes(r.originalSize)} → ${fmtBytes(r.newSize)}</strong> <span style="color:var(--success)">(${pct}% smaller)</span></p>`
+    + bullets([...describeImages(r), ...checkList, ...(r.notes || [])])
+    + `<p style="margin-top:10px;font-size:13px;color:${stored ? 'var(--text-secondary)' : 'var(--warning)'}">${stored
+        ? `Saved in your FYLO library as <strong>${esc(outName)}</strong>. Your original is unchanged.`
+        : 'It could not be stored in the FYLO library (storage unavailable) — use “Save to device” to keep it.'}</p>`,
+    [
+      { label: 'Save to device', onClick: () => downloadBlob(blob, outName) },
+      ...(stored ? [{ label: 'Open', primary: true, onClick: () => bus.emit('reader:openRequest', { fileId: saved[0] }) }] : [{ label: 'Done', primary: true }]),
+    ]);
 }
 
 // ── IMG → PDF ─────────────────────────────────────────────────
@@ -425,65 +503,105 @@ async function toolImgToPdf(images) {
 }
 
 // ── PDF → IMG ─────────────────────────────────────────────────
-// Safe multi-page export: renders all pages to blobs first, then packages into
-// a ZIP-like sequential download using object URLs — avoids browser popup blocking.
-async function toolPdfToImg(file, format = 'png') {
+// Each page is rendered, encoded and saved through Device.saveBlob (Android: verified write to Pictures/FYLO/<name>/;
+// browser: normal download). Plain <a download> clicks are ignored by Android WebView, which is why images used to
+// "convert" without ever appearing anywhere.
+export function parsePageRange(text, total) {
+  const t = (text || '').trim();
+  if (!t) return { pages: Array.from({ length: total }, (_, i) => i + 1) };
+  const set = new Set();
+  for (const part of t.split(',')) {
+    const m = part.trim().match(/^(\d+)(?:\s*-\s*(\d+))?$/);
+    if (!m) return { error: `“${part.trim()}” is not a page or range` };
+    const a = Number(m[1]), b = m[2] ? Number(m[2]) : a;
+    if (a < 1 || b < a || b > total) return { error: `Pages must be between 1 and ${total}` };
+    for (let p = a; p <= b; p++) set.add(p);
+  }
+  return { pages: [...set].sort((x, y) => x - y) };
+}
+
+async function toolPdfToImg(file, format = 'png', rangeText = '') {
   if (!file) { toast('Select a PDF'); return; }
+  if (!file.blob) { toast('File data unavailable'); return; }
   if (!await Libs.waitForPdfJs()) { toast('PDF.js not loaded.'); return; }
-  toast('Rendering pages…');
+  const prog = showProgress('Converting to images', { text: 'Opening the PDF…' });
+  const base = file.name.replace(/\.pdf$/i, '');
+  const png  = format === 'png';
+  const mime = png ? 'image/png' : 'image/jpeg';
+  const ext  = png ? 'png' : 'jpg';
+  let pdf;
   try {
-    const ab   = await file.blob.arrayBuffer();
-    const pdf  = await Libs.pdfjs.getDocument({ data: ab }).promise;
-    const base = file.name.replace(/\.pdf$/i, '');
-    const n    = pdf.numPages;
-    const mime = format === 'png' ? 'image/png' : 'image/jpeg';
-    const ext  = format === 'png' ? 'png' : 'jpg';
+    pdf = await Libs.pdfjs.getDocument({ data: await file.blob.arrayBuffer() }).promise;
+  } catch (e) {
+    prog.done();
+    const pw = e?.name === 'PasswordException';
+    showResult('Couldn’t open the PDF', `<p>${pw ? 'This PDF is password-protected. Unlock it first.' : 'This file could not be read as a valid PDF.'}</p>`);
+    return;
+  }
+  const sel = parsePageRange(rangeText, pdf.numPages);
+  if (sel.error) { prog.done(); try { pdf.destroy?.(); } catch { /* ignore */ } toast(sel.error, 4000); return; }
 
-    // Render all pages to blobs (sequential — avoid canvas memory pile-up)
-    const blobs = [];
-    for (let i = 1; i <= n; i++) {
-      toast(`Rendering page ${i} of ${n}…`);
-      const page = await pdf.getPage(i);
-      // Scale to ~150 dpi equivalent (reasonable quality, not OOM-inducing)
-      const vp = page.getViewport({ scale: 1.5 });
-      const c  = document.createElement('canvas');
-      c.width  = vp.width;
-      c.height = vp.height;
-      await page.render({ canvasContext: c.getContext('2d'), viewport: vp }).promise;
-      const blob = await new Promise(res => c.toBlob(res, mime, 0.88));
-      blobs.push({ blob, name: `${base}_page${i}.${ext}` });
-      // Release canvas memory
-      c.width = 0; c.height = 0;
+  const saved = [], failed = [];
+  let last = null;
+  for (let k = 0; k < sel.pages.length; k++) {
+    if (prog.signal.aborted) break;
+    const p = sel.pages[k];
+    prog.update(`Page ${p} — ${k + 1} of ${sel.pages.length}`, k / sel.pages.length);
+    let canvas = null;
+    try {
+      const page = await pdf.getPage(p);
+      const v1 = page.getViewport({ scale: 1 });
+      const scale = Math.min(2, 4096 / Math.max(v1.width, v1.height));     // ≈144 dpi, never beyond 4096 px
+      const vp = page.getViewport({ scale });
+      canvas = document.createElement('canvas');
+      canvas.width = Math.ceil(vp.width); canvas.height = Math.ceil(vp.height);
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, canvas.width, canvas.height);   // JPG has no transparency
+      await page.render({ canvasContext: ctx, viewport: vp }).promise;
+      page.cleanup?.();
+      const blob = await new Promise(res => canvas.toBlob(res, mime, 0.92));
+      if (!blob) throw new Error('The page is too large to encode as an image');
+      const r = await Device.saveBlob(blob, `${base}_page${p}.${ext}`, { kind: 'image', subdir: base, mime, signal: prog.signal });
+      if (r.ok) { saved.push({ page: p, ...r }); last = r; }
+      else if (!r.cancelled) failed.push({ page: p, error: r.error });
+      else break;
+    } catch (e) {
+      failed.push({ page: p, error: e?.message || String(e) });
+    } finally {
+      if (canvas) { canvas.width = 0; canvas.height = 0; }
     }
+    await new Promise(r => setTimeout(r, 0));
+  }
+  const cancelled = prog.signal.aborted;
+  prog.done();
+  try { pdf.destroy?.(); } catch { /* ignore */ }
 
-    if (n === 1) {
-      // Single page — direct download, no popup issue
-      const url = URL.createObjectURL(blobs[0].blob);
-      const a   = document.createElement('a');
-      a.href = url; a.download = blobs[0].name;
-      document.body.appendChild(a); a.click();
-      document.body.removeChild(a);
-      setTimeout(() => URL.revokeObjectURL(url), 5000);
-      toast('Image downloaded');
-    } else {
-      // Multiple pages — sequential async downloads with small delay to avoid blocking
-      // Browsers allow programmatic downloads when triggered in a user-gesture context;
-      // we stagger them with 80 ms gaps so the browser doesn't treat them as popup spam.
-      let done = 0;
-      const downloadNext = () => {
-        if (done >= blobs.length) { toast(`${n} images downloaded`); return; }
-        const { blob, name } = blobs[done++];
-        const url = URL.createObjectURL(blob);
-        const a   = document.createElement('a');
-        a.href = url; a.download = name;
-        document.body.appendChild(a); a.click();
-        document.body.removeChild(a);
-        setTimeout(() => URL.revokeObjectURL(url), 10000);
-        setTimeout(downloadNext, 80);
-      };
-      downloadNext();
-    }
-  } catch(e) { log.error('PdfToImg failed:', e); toast('Conversion failed: ' + e.message); }
+  // ── Honest summary ──
+  const total = sel.pages.length;
+  const verified = saved.length > 0 && saved.every(r => r.verified);
+  const dir = saved.length && verified ? saved[0].path.replace(/\/[^/]*$/, '') : '';
+  const title = cancelled ? 'Conversion cancelled'
+              : failed.length === 0 ? `Saved ${saved.length} image${saved.length === 1 ? '' : 's'}`
+              : saved.length === 0 ? 'No images were saved' : `Saved ${saved.length} of ${total} pages`;
+  let body = '';
+  if (saved.length) {
+    body += verified
+      ? `<p>${saved.length} ${ext.toUpperCase()} file${saved.length === 1 ? '' : 's'} saved and checked in <strong>${esc(dir)}</strong> — find them in your Gallery or a file manager.</p>`
+      : `<p>${saved.length} download${saved.length === 1 ? '' : 's'} started in your browser. Browsers don’t confirm where files end up, so check your downloads folder.</p>`;
+  }
+  if (cancelled) body += `<p style="margin-top:8px">Stopped after ${saved.length} of ${total} pages; the pages already saved were kept.</p>`;
+  if (failed.length) {
+    body += `<p style="margin-top:8px;color:var(--warning)">${failed.length} page${failed.length === 1 ? '' : 's'} failed:</p>`
+      + bullets(failed.slice(0, 8).map(f => `Page ${f.page}: ${esc(f.error)}`).concat(failed.length > 8 ? [`…and ${failed.length - 8} more`] : []));
+  }
+  const actions = [];
+  const uris = saved.map(r => r.uri).filter(Boolean);
+  if (Device.isAndroid && uris.length) {
+    actions.push({ label: 'Share', onClick: () => { Device.share(uris, mime).then(ok => { if (!ok) toast('Could not open the share sheet'); }); } });
+    if (last?.uri) actions.push({ label: 'View', onClick: () => { Device.view(last.uri, mime).then(ok => { if (!ok) toast('No app found to open the image'); }); } });
+  }
+  actions.push({ label: 'Done', primary: true });
+  showResult(title, body || '<p>Nothing was saved.</p>', actions);
 }
 
 // ── PROTECT ───────────────────────────────────────────────────
@@ -856,7 +974,14 @@ function showCompressModal() {
   openModal(
     'Compress PDF',
     `<p style="color:var(--text-secondary);margin-bottom:12px">Select a PDF to compress:</p>
-     <div class="tool-file-list" style="max-height:260px;overflow-y:auto">${_fileListHTML('compress-file')}</div>`,
+     <div class="tool-file-list" style="max-height:260px;overflow-y:auto">${_fileListHTML('compress-file')}</div>
+     <div id="compress-options" class="hidden" style="margin-top:16px">
+       <label for="compress-level" style="color:var(--text-secondary);font-size:13px">Compression level:</label>
+       <select class="select-field" id="compress-level" style="margin-top:8px">
+         ${Object.entries(LEVELS).map(([k, v]) => `<option value="${k}" ${k === (State.settings.compressLevel || 'medium') ? 'selected' : ''}>${esc(v.label)}</option>`).join('')}
+       </select>
+       <p style="margin-top:8px;color:var(--text-tertiary);font-size:12px">Shrinks embedded images; text stays sharp and searchable. If the file can’t be made smaller, FYLO tells you instead of saving a copy.</p>
+     </div>`,
     `<button class="btn btn-secondary modal-cancel">Cancel</button>
      <button class="btn btn-primary hidden" id="compress-run-btn">Compress</button>`
   );
@@ -867,10 +992,15 @@ function showCompressModal() {
       _tool.files = [file];
       document.querySelectorAll('[data-compress-file]').forEach(i => i.style.opacity = '0.4');
       el.style.opacity = '1';
+      document.getElementById('compress-options')?.classList.remove('hidden');
       document.getElementById('compress-run-btn')?.classList.remove('hidden');
     });
   });
-  document.getElementById('compress-run-btn')?.addEventListener('click', () => { closeModal(); toolCompress(_tool.files[0]); });
+  document.getElementById('compress-run-btn')?.addEventListener('click', () => {
+    const lvl = document.getElementById('compress-level')?.value || 'medium';
+    const file = _tool.files[0];
+    closeModal(); toolCompress(file, lvl);
+  });
   document.querySelector('.modal-cancel')?.addEventListener('click', closeModal);
 }
 
@@ -981,9 +1111,11 @@ function showPdfToImgModal() {
      <div id="pdf2img-options" class="hidden" style="margin-top:16px">
        <label style="color:var(--text-secondary);font-size:13px">Format:</label>
        <select class="select-field" id="pdf2img-format" style="margin-top:8px">
-         <option value="png">PNG (lossless)</option>
-         <option value="jpg">JPG (smaller)</option>
+         <option value="png" ${State.settings.imageFormat !== 'jpg' ? 'selected' : ''}>PNG (lossless)</option>
+         <option value="jpg" ${State.settings.imageFormat === 'jpg' ? 'selected' : ''}>JPG (smaller)</option>
        </select>
+       <label for="pdf2img-pages" style="display:block;margin-top:14px;color:var(--text-secondary);font-size:13px">Pages (optional):</label>
+       <input type="text" class="input-field" id="pdf2img-pages" placeholder="All pages — or e.g. 1-3, 5" autocomplete="off" style="margin-top:8px">
      </div>`,
     `<button class="btn btn-secondary modal-cancel">Cancel</button>
      <button class="btn btn-primary hidden" id="pdf2img-run-btn">Convert</button>`
@@ -1001,7 +1133,9 @@ function showPdfToImgModal() {
   });
   document.getElementById('pdf2img-run-btn')?.addEventListener('click', () => {
     const fmt = document.getElementById('pdf2img-format')?.value || 'png';
-    closeModal(); toolPdfToImg(_tool.files[0], fmt);
+    const range = document.getElementById('pdf2img-pages')?.value || '';
+    const file = _tool.files[0];
+    closeModal(); toolPdfToImg(file, fmt, range);
   });
   document.querySelector('.modal-cancel')?.addEventListener('click', closeModal);
 }
