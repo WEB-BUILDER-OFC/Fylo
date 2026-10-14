@@ -238,7 +238,7 @@ top-level `Download` folder — pick a folder *inside* it, or `Documents`. FYLO 
 cd fylo-android
 ./gradlew fetchPdfLibs    # once (PDF.js + PDF-Lib into assets/libs)
 ./gradlew assembleDebug   # syncWebAssets (a true mirror of fylo-web/) + verifyWebVersion run first
-./scripts/verify-apk.sh   # checks versionName/versionCode and that packaged web files == fylo-web/
+bash scripts/verify-apk.sh   # checks versionName/versionCode and that packaged web files == fylo-web/
 ```
 
 ## Releasing an update that installs over the old one

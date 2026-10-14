@@ -61,7 +61,7 @@ jobs:
         working-directory: fylo-android
         run: |
           export ANDROID_HOME="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
-          ./scripts/verify-apk.sh app/build/outputs/apk/debug/app-debug.apk
+          bash ./scripts/verify-apk.sh app/build/outputs/apk/debug/app-debug.apk
 
       - name: Inspect APK contents (web assets check)
         run: |
@@ -72,6 +72,7 @@ jobs:
           unzip -l "$APK" | grep "assets/libs" || echo "WARNING: no libs found"
 
       - name: Upload debug APK
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: fylo-debug-apk
