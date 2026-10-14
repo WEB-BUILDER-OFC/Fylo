@@ -20,7 +20,7 @@ fail=0
 chk() { if [ "$2" = "$3" ]; then echo "OK   $1 = $3"; else echo "FAIL $1: expected '$3', got '$2'"; fail=1; fi; }
 chk versionName "$(sed -n "s/.*versionName='\([^']*\)'.*/\1/p" <<<"$BADGE")" "$VER"
 chk versionCode "$(sed -n "s/.*versionCode='\([^']*\)'.*/\1/p" <<<"$BADGE")" "${FYLO_EXPECT_CODE:-$CODE}"
-PKG=$(sed -n "s/.*name='\([^']*\)'.*/\1/p" <<<"$BADGE")
+PKG=$(sed -n "s/^package: name='\([^']*\)'.*/\1/p" <<<"$BADGE")
 case "$PKG" in com.fylo.app|com.fylo.app.debug) echo "OK   applicationId = $PKG";; *) echo "FAIL applicationId unexpected: $PKG"; fail=1;; esac
 
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
