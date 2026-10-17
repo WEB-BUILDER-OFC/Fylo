@@ -145,6 +145,52 @@ async function jpegFromRaw(raw, w, h, channels, level) {
   return { bytes: new Uint8Array(await blob.arrayBuffer()), w: t.w, h: t.h };
 }
 
+// ── Worker pool: heavy per-image work runs off the main thread, several images at once ──────────────────────────
+const WORKER_URL = new URL('./imgworker.js', import.meta.url);
+const workersSupported = () => typeof Worker !== 'undefined' && typeof OffscreenCanvas !== 'undefined'
+  && typeof createImageBitmap !== 'undefined';
+
+class ImagePool {
+  constructor(size) { this.size = size; this.idle = []; this.all = []; this.queue = []; this.pending = new Map(); this.seq = 0; this.dead = false; }
+  _spawn() {
+    const w = new Worker(WORKER_URL);
+    w.onmessage = (e) => {
+      const p = this.pending.get(e.data.id); if (!p) return;
+      this.pending.delete(e.data.id);
+      this.idle.push(p.worker); this._pump();
+      e.data.ok ? p.res(e.data) : p.rej(Object.assign(new Error(e.data.error), { decode: true }));
+    };
+    w.onerror = (ev) => {                       // infrastructure failure (blocked script, crash) → caller falls back to main thread
+      ev.preventDefault?.();
+      this.dead = true;
+      for (const [id, p] of this.pending) if (p.worker === w) { this.pending.delete(id); p.rej(Object.assign(new Error('worker failed'), { infra: true })); }
+    };
+    this.all.push(w); return w;
+  }
+  _pump() {
+    while (this.queue.length) {
+      let w = this.idle.pop();
+      if (!w && this.all.length < this.size) w = this._spawn();
+      if (!w) return;
+      const job = this.queue.shift();
+      this.pending.set(job.id, { res: job.res, rej: job.rej, worker: w });
+      w.postMessage(job.msg, job.transfer);
+    }
+  }
+  run(msg, transfer) {
+    if (this.dead) return Promise.reject(Object.assign(new Error('worker unavailable'), { infra: true }));
+    return new Promise((res, rej) => { const id = ++this.seq; this.queue.push({ id, msg: { ...msg, id }, transfer, res, rej }); this._pump(); });
+  }
+  close() { for (const w of this.all) try { w.terminate(); } catch { /* ignore */ } this.all = []; this.idle = []; this.queue = []; }
+}
+
+async function mainThreadEncode(task, data, level) {
+  if (task.kind === 'dct') return jpegFromJpeg(data, task.w, task.h, level);
+  let raw = await inflate(data);
+  if (task.predictor >= 10) raw = unpredictPng(raw, task.columns, task.colors, 8);
+  return jpegFromRaw(raw, task.w, task.h, task.channels, level);
+}
+
 // ── pdf-lib object helpers ───────────────────────────────────────────────────
 function lib() {
   const L = Libs.pdflib;
@@ -297,12 +343,18 @@ export async function compressPdf(input, opts = {}) {
     }
   }
 
-  // 3 ── recompress images ────────────────────────────────────────────────────
-  for (let i = 0; i < images.length; i++) {
+  // 3 ── recompress images (worker pool, several at once) ─────────────────────────────────────────────────────────
+  let pool = null;
+  if (images.length && workersSupported()) {
+    try { pool = new ImagePool(Math.max(2, Math.min(4, (navigator.hardwareConcurrency || 4) - 1))); } catch { pool = null; }
+  }
+  const onAbort = () => pool?.close();
+  signal?.addEventListener('abort', onAbort);
+  let doneImages = 0;
+  const t0 = Date.now();
+
+  const handleImage = async ({ ref, obj, filter, lead }) => {
     checkAbort(signal);
-    const { ref, obj, filter, lead } = images[i];
-    progress('images', `Recompressing images (${i + 1} of ${images.length})…`, 0.05 + 0.65 * (i / Math.max(1, images.length)));
-    await tick();
     const dict = obj.dict;
     const w = dict.lookup(PDFName.of('Width')).asNumber();
     const h = dict.lookup(PDFName.of('Height')).asNumber();
@@ -311,27 +363,42 @@ export async function compressPdf(input, opts = {}) {
     const oldBytes = obj.getContents();
     stats.bytesBefore += oldBytes.length;
     try {
-      let enc;
       let data = oldBytes;
       for (const l of lead) data = l === 'ASCII85Decode' ? ascii85Decode(data) : asciiHexDecode(data);
+      let task, predictor = 1, columns = 1, colors = 1;
       if (filter === 'DCTDecode') {
-        enc = await jpegFromJpeg(data, w, h, level);
+        // Already-compact JPEG that doesn't need shrinking: re-encoding would only add generation loss.
+        if (Math.max(w, h) <= level.maxDim && data.length / (w * h) < 0.2) {
+          skip('already compact'); stats.kept++; stats.bytesAfter += oldBytes.length; return;
+        }
+        task = { kind: 'dct' };
       } else {
         const bpc = dict.lookup(PDFName.of('BitsPerComponent'))?.asNumber?.();
-        if (bpc !== 8) { skip(`${bpc || '?'}-bit images`); stats.bytesBefore -= oldBytes.length; continue; }
-        let raw = await inflate(data);
+        if (bpc !== 8) { skip(`${bpc || '?'}-bit images`); stats.bytesBefore -= oldBytes.length; return; }
         let parms = dict.lookup(PDFName.of('DecodeParms'));
         if (parms instanceof L.PDFArray) parms = parms.lookup(lead.length);   // chain: one entry per filter
-        const predictor = parms?.lookup?.(PDFName.of('Predictor'))?.asNumber?.() ?? 1;
+        predictor = parms?.lookup?.(PDFName.of('Predictor'))?.asNumber?.() ?? 1;
         if (predictor >= 10) {
-          const columns = parms.lookup(PDFName.of('Columns'))?.asNumber?.() ?? 1;
-          const colors  = parms.lookup(PDFName.of('Colors'))?.asNumber?.() ?? 1;
-          raw = unpredictPng(raw, columns, colors, 8);
+          columns = parms.lookup(PDFName.of('Columns'))?.asNumber?.() ?? 1;
+          colors  = parms.lookup(PDFName.of('Colors'))?.asNumber?.() ?? 1;
         } else if (predictor !== 1) {
-          skip('TIFF predictor'); stats.bytesBefore -= oldBytes.length; continue;
+          skip('TIFF predictor'); stats.bytesBefore -= oldBytes.length; return;
         }
-        enc = await jpegFromRaw(raw, w, h, channels, level);
+        task = { kind: 'raw' };
       }
+      Object.assign(task, { w, h, channels, predictor, columns, colors, maxDim: level.maxDim, quality: level.quality });
+      let enc = null;
+      if (pool && !pool.dead) {
+        try {
+          const copy = data.slice().buffer;     // copy: transferring a view would detach the whole PDF buffer
+          const r = await pool.run({ ...task, bytes: copy }, [copy]);
+          enc = { bytes: new Uint8Array(r.bytes), w: r.w, h: r.h };
+        } catch (e) {
+          checkAbort(signal);
+          if (!e?.infra) throw e;               // genuine decode failure for this image
+        }
+      }
+      if (!enc) enc = await mainThreadEncode(task, data, level);
       if (enc.bytes.length < oldBytes.length * IMAGE_ACCEPT_RATIO) {
         const nd = dict.clone();
         nd.set(PDFName.of('Width'), PDFNumber.of(enc.w));
@@ -352,7 +419,30 @@ export async function compressPdf(input, opts = {}) {
       if (e?.name === 'AbortError') throw e;
       skip('could not be decoded');
       stats.bytesAfter += oldBytes.length;
+    } finally {
+      doneImages++;
+      const secs = Math.round((Date.now() - t0) / 1000);
+      progress('images', `Recompressing images (${doneImages} of ${images.length})…${secs >= 3 ? ` ${secs}s` : ''}`,
+        0.05 + 0.65 * (doneImages / Math.max(1, images.length)));
     }
+  };
+
+  try {
+    progress('images', `Recompressing images (0 of ${images.length})…`, 0.05);
+    const lanes = pool ? pool.size + 1 : 1;     // keep the workers fed; main-thread fallback runs one at a time
+    let next = 0;
+    const lane = async () => {
+      while (next < images.length) {
+        checkAbort(signal);
+        const item = images[next++];
+        await handleImage(item);
+        if (!pool) await tick();
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(lanes, images.length) }, lane));
+  } finally {
+    signal?.removeEventListener('abort', onAbort);
+    pool?.close();
   }
 
   // 4 ── deflate streams stored uncompressed ──────────────────────────────────
@@ -458,7 +548,7 @@ export async function verifyOutput(originalBuf, outBytes, pageCount, signal) {
     let worst = 0;
     for (const n of pages) {
       checkAbort(signal);
-      const [ca, cb] = [await renderSmall(docA, n), await renderSmall(docB, n)];
+      const [ca, cb] = await Promise.all([renderSmall(docA, n), renderSmall(docB, n)]);
       if (ca.width !== cb.width || ca.height !== cb.height) return { ok: false, reason: `page ${n} size changed`, checks };
       const a = sampleLuma(ca), b = sampleLuma(cb);
       let sum = 0;

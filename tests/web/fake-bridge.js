@@ -14,7 +14,7 @@
   window.AndroidBridge = {
     getPlatform: () => 'android',
     getAndroidVersion: () => '34',
-    getAppInfo: () => JSON.stringify({ versionName: cfg.versionName || '2.2.1', versionCode: 20201, lastUpdateTime: 1, packageName: 'com.fylo.app.debug', sdk: 34 }),
+    getAppInfo: () => JSON.stringify({ versionName: cfg.versionName || '2.2.2', versionCode: 20202, lastUpdateTime: 1, packageName: 'com.fylo.app.debug', sdk: 34 }),
     saveBegin(kind, subdir, filename, mime) {
       if (cfg.failBeginContains && filename.includes(cfg.failBeginContains)) return bad('Simulated: the system refused to create the file');
       const id = 's' + (++F.n); F.sessions[id] = { kind, subdir, filename, mime, parts: [], bytes: 0 }; return ok({ id });

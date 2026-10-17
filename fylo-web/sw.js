@@ -49,10 +49,12 @@ const STATIC_ASSETS = [
   './features/files/ondevice.js',
   './features/files/library.js',
   './features/tools/pdfcompress.js',
+  './features/tools/imgworker.js',
   // Assets
   './assets/css/main.css',
   './assets/icons/icon-192.png',
   './assets/icons/icon-512.png',
+  './assets/icons/logo-tile.png',
 ];
 
 self.addEventListener('install', e => {
