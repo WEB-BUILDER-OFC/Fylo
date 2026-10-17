@@ -42,6 +42,22 @@ jobs:
         working-directory: fylo-android
         run: ./gradlew fetchPdfLibs --no-daemon
 
+      - name: Use your own signing key (only if the FYLO_KEYSTORE_B64 secret is set)
+        working-directory: fylo-android
+        env:
+          KS_B64: ${{ secrets.FYLO_KEYSTORE_B64 }}
+          KS_PASS: ${{ secrets.FYLO_KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.FYLO_KEY_ALIAS }}
+          KS_KEYPASS: ${{ secrets.FYLO_KEY_PASSWORD }}
+        run: |
+          if [ -n "$KS_B64" ]; then
+            echo "$KS_B64" | base64 -d > ../fylo-ci-key.jks
+            printf 'storeFile=../fylo-ci-key.jks\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' "$KS_PASS" "$KS_ALIAS" "${KS_KEYPASS:-$KS_PASS}" > keystore.properties
+            echo "Signing with the key from repository secrets"
+          else
+            echo "No signing secret set - using the committed fylo-signing.keystore (same key on every run)"
+          fi
+
       - name: Build debug APK
         working-directory: fylo-android
         run: ./gradlew assembleDebug --no-daemon --stacktrace

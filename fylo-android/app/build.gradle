@@ -19,14 +19,24 @@ def readFyloVersion() {
 def fyloVersion = readFyloVersion()
 def fyloVersionCode = (project.findProperty('fyloVersionCode') ?: fyloVersion.code).toString().toInteger()
 
-// ─── Optional stable signing key ──────────────────────────────────────────────
-// Android refuses to install an update signed with a DIFFERENT key than the installed app. With no
-// keystore.properties the default debug key (~/.android/debug.keystore) is used exactly as before.
-// To make updates work across machines / CI, create fylo-android/keystore.properties (git-ignored):
-//   storeFile=../fylo-release.jks   storePassword=...   keyAlias=...   keyPassword=...
+// ─── Stable signing key (THIS is what makes "install over the old app" work) ─────────────────────────────────
+// Android only installs an APK over an existing app if BOTH have the same package name AND the same signing
+// certificate (and the new versionCode is not lower). A fresh CI machine generates a NEW random debug key every
+// run, so each CI-built APK used to carry a different certificate -> "App not installed". Every build now signs with
+// one fixed key, so every APK built from here on can update the previous one, on any machine.
+//   1. fylo-android/keystore.properties (git-ignored, optional) -> your own key:
+//        storeFile=../my-release.jks   storePassword=...   keyAlias=...   keyPassword=...
+//   2. otherwise fylo-android/signing/fylo-signing.keystore (committed; alias "fylo"). Its password is public, so it
+//      is a CONVENIENCE key for sideloaded/personal builds, not a Play Store secret — use option 1 (or the
+//      FYLO_KEYSTORE_B64 CI secret) for anything you distribute widely. NEVER switch keys once users have the app.
 def ksFile = rootProject.file('keystore.properties')
 def ksProps = new Properties()
 if (ksFile.exists()) ksFile.withInputStream { ksProps.load(it) }
+def fyloKeystore  = ksFile.exists() ? rootProject.file(ksProps['storeFile']) : rootProject.file('signing/fylo-signing.keystore')
+def fyloStorePass = ksFile.exists() ? ksProps['storePassword'] : 'fyloSigning2026'
+def fyloKeyAlias  = ksFile.exists() ? ksProps['keyAlias']      : 'fylo'
+def fyloKeyPass   = ksFile.exists() ? ksProps['keyPassword']   : 'fyloSigning2026'
+if (!fyloKeystore.exists()) throw new GradleException("Signing keystore not found: ${fyloKeystore} (an APK signed with a different key cannot update an installed FYLO)")
 
 android {
     namespace 'com.fylo.app'
@@ -41,13 +51,11 @@ android {
     }
 
     signingConfigs {
-        if (ksFile.exists()) {
-            create('fylo') {
-                storeFile rootProject.file(ksProps['storeFile'])
-                storePassword ksProps['storePassword']
-                keyAlias ksProps['keyAlias']
-                keyPassword ksProps['keyPassword']
-            }
+        fylo {
+            storeFile fyloKeystore
+            storePassword fyloStorePass
+            keyAlias fyloKeyAlias
+            keyPassword fyloKeyPass
         }
     }
 
@@ -55,10 +63,10 @@ android {
         debug {
             debuggable true
             applicationIdSuffix ".debug"      // keep: changing the id would install as a NEW app and strand user data
-            if (ksFile.exists()) signingConfig signingConfigs.fylo
+            signingConfig signingConfigs.fylo
         }
         release {
-            if (ksFile.exists()) signingConfig signingConfigs.fylo
+            signingConfig signingConfigs.fylo
             minifyEnabled false   // Web assets are already optimised; no need to minify Java
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }

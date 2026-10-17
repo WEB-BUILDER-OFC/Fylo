@@ -10,9 +10,10 @@
  * This file only touches the DOM inside #ondevice-panel and talks to the rest of the app through the bus.
  */
 
-import { bus } from '../../core/eventBus.js';
+import { bus, EVENTS } from '../../core/eventBus.js';
 import { State } from '../../core/state.js';
 import { Device } from '../../core/device.js';
+import { Library } from './library.js';
 import { toast, openModal, closeModal, formatFileSize, formatDate } from '../../core/ui.js';
 import { createLogger } from '../../core/logger.js';
 
@@ -63,26 +64,50 @@ async function scanAll({ force = false } = {}) {
 
 // ── Adding / removing folders ────────────────────────────────────────────────
 let _picking = false;
-async function addFolder() {
+
+/** Jump to Files → On Device (used after a folder was added from Settings or the menu). */
+function showDeviceTab() {
+  bus.emit(EVENTS.APP_NAV_REQUEST, { page: 'files' });
+  setTimeout(() => bus.emit('files:selectTab', { tab: 'device' }), 150);
+}
+
+async function onFolderAdded(folder, { goToList = false } = {}) {
+  if (folder?.persisted === false) toast('Added for now, but Android would not keep this permission after a restart.', 5000);
+  else toast(`Added “${folder?.name || 'folder'}”`);
+  if (folder?.uri) _s.scans.delete(folder.uri);
+  await scanAll({ force: true });
+  bus.emit('library:refresh', {});
+  refreshManager();
+  if (goToList && !isActive()) showDeviceTab();
+}
+
+async function addFolder({ goToList = false } = {}) {
   if (_picking) return;                     // repeated taps while the system picker is open
   _picking = true;
   try {
+    toast('Opening Android’s folder picker…', 1800);
     const r = await Device.pickFolder();
-    if (r.cancelled) return;
-    if (!r.ok) { toast('Could not add the folder: ' + (r.error || 'unknown error'), 4500); return; }
-    if (r.folder?.persisted === false) toast('Added for now, but Android would not keep this permission after a restart.', 5000);
-    else toast(`Added “${r.folder.name}”`);
-    _s.scans.delete(r.folder.uri);
-    await scanAll({ force: true });
-    refreshManager();
+    log.info('folder picker result', r);
+    if (r.cancelled) { toast('No folder chosen'); return; }
+    if (!r.ok) { toast('Could not add the folder: ' + (r.error || 'unknown error'), 5000); return; }
+    await onFolderAdded(r.folder, { goToList });
   } finally { _picking = false; }
 }
+
+// The picker's answer can arrive when nothing is waiting for it (page reloaded / Activity recreated while the system
+// picker was open). Native already saved the grant, so just refresh from it.
+window.addEventListener('fylo:folderPicked', async e => {
+  const r = e.detail || {};
+  if (r.ok && r.folder) await onFolderAdded(r.folder, { goToList: true });
+  else if (r.error) toast('Could not add the folder: ' + r.error, 5000);
+});
 
 function removeFolder(uri) {
   Device.removeFolder(uri);
   _s.scans.delete(uri);
   _s.folders = Device.folders();
   render(); refreshManager();
+  bus.emit('library:refresh', {});
 }
 
 // ── Opening a PDF ────────────────────────────────────────────────────────────
@@ -90,25 +115,16 @@ async function openEntry(entry, folderUri) {
   if (_s.busy.has(entry.uri)) return;
   _s.busy.add(entry.uri); render();
   try {
-    // Already imported? Open the library copy instead of copying the file again.
-    const dup = State.files.find(f => f.name === entry.name && f.size === entry.size && (f.lastModified || 0) === (entry.modified || 0));
-    if (dup) { bus.emit('reader:openRequest', { fileId: dup.id }); return; }
-    if (entry.size > MAX_OPEN_BYTES) { toast(`This PDF is ${formatFileSize(entry.size)} — too large to open safely in FYLO.`, 5000); return; }
-    toast('Opening…', 1500);
-    let blob;
-    try { blob = await Device.readDocument(entry.uri); }
-    catch (e) {
-      if (e.code === 'ACCESS_REVOKED') { toast('Access to that folder was removed. Add it again to keep browsing.', 5000); _s.scans.set(folderUri, { status: 'revoked', files: [], at: Date.now() }); }
-      else if (e.code === 'NOT_FOUND') { toast('That file is no longer there — refreshing the list.'); scanAll({ force: true }); }
-      else toast(e.message || 'Could not read the file', 5000);
+    // Open IN PLACE: the library keeps a tiny reference record (no copy of the PDF). Reading happens through
+    // Android's document provider when the Reader loads it, so a revoked/moved file is reported there.
+    const rec = Library.adopt({ name: entry.name, size: entry.size, modified: entry.modified, ref: { kind: 'saf', uri: entry.uri } });
+    const chk = await Library.checkOpenable(rec);
+    if (!chk.ok) {
+      if (chk.code === 'ACCESS_REVOKED') { toast('Access to that folder was removed. Add it again to keep browsing.', 5000); _s.scans.set(folderUri, { status: 'revoked', files: [], at: Date.now() }); }
+      else { toast('That file is no longer there — refreshing the list.'); scanAll({ force: true }); }
       return;
     }
-    const file = new File([blob], entry.name, { type: 'application/pdf', lastModified: entry.modified || Date.now() });
-    const ids = await new Promise(res => bus.emit('files:incoming', { files: [file], onSaved: res }));
-    // handleFiles adds the file to the library even when persisting fails; find it either way.
-    const id = ids?.[0] || State.files.find(f => f.name === entry.name && f.size === file.size)?.id;
-    if (!id) { toast('Could not add the PDF to FYLO'); return; }
-    bus.emit('reader:openRequest', { fileId: id });
+    bus.emit('files:open', { fileId: rec.id });
   } finally { _s.busy.delete(entry.uri); if (isActive()) render(); }
 }
 
@@ -133,12 +149,12 @@ function render() {
   if (!el) return;
   const keepFocus = document.activeElement?.id === 'ondevice-search' ? { pos: document.activeElement.selectionStart } : null;
 
-  const note = `<div class="ondevice-note">FYLO can only see the folders you choose here — Android doesn’t let apps browse everything on a phone without broad storage access, which FYLO deliberately doesn’t ask for. Pick the folders where your PDFs live (for example <em>Documents</em> or a folder inside <em>Download</em>). Android may refuse the main <em>Download</em> folder or <em>Android/data</em>; choose a sub-folder instead.</div>`;
+  const note = `<div class="ondevice-note">Folders you choose here are listed in <strong>All PDFs</strong> too, and their PDFs open in place (no copy). This works without any broad storage permission. To see every PDF on the phone at once instead, allow access from Settings → PDFs on this phone. Android may refuse the main <em>Download</em> folder or <em>Android/data</em>; choose a sub-folder instead.</div>`;
 
   if (!_s.folders.length) {
     el.innerHTML = `${note}<div class="empty-state" style="padding:24px 0"><h3>No folders chosen yet</h3><p>Choose a folder to see the PDFs inside it.</p></div>
       <div class="ondevice-toolbar"><button class="btn btn-primary" id="od-add">Choose a folder</button></div>`;
-    el.querySelector('#od-add').addEventListener('click', addFolder);
+    el.querySelector('#od-add').addEventListener('click', () => addFolder());
     return;
   }
 
@@ -189,16 +205,16 @@ function render() {
     </div>
     <input type="text" class="input-field" id="ondevice-search" placeholder="Filter by name…" value="${esc(_s.filter)}" autocomplete="off" aria-label="Filter PDFs">
     ${statuses.join('')}${listHTML}
-    ${list.length ? `<div class="ondevice-status">${list.length} PDF${list.length === 1 ? '' : 's'}. Opening one adds a copy to your FYLO library (it isn’t imported twice).</div>` : ''}`;
+    ${list.length ? `<div class="ondevice-status">${list.length} PDF${list.length === 1 ? '' : 's'}. Opening one uses the file where it is — nothing is copied into FYLO.</div>` : ''}`;
 
-  el.querySelector('#od-add').addEventListener('click', addFolder);
+  el.querySelector('#od-add').addEventListener('click', () => addFolder());
   el.querySelector('#od-refresh').addEventListener('click', () => scanAll({ force: true }));
   el.querySelector('#od-sort').addEventListener('change', e => { _s.sort = e.target.value; render(); });
   el.querySelector('#od-more')?.addEventListener('click', () => { _s.shown += PAGE_SIZE; render(); });
   const search = el.querySelector('#ondevice-search');
   search.addEventListener('input', e => { _s.filter = e.target.value; _s.shown = PAGE_SIZE; render(); });
   el.querySelectorAll('[data-remove]').forEach(b => b.addEventListener('click', () => removeFolder(b.dataset.remove)));
-  el.querySelectorAll('[data-regrant]').forEach(b => b.addEventListener('click', addFolder));
+  el.querySelectorAll('[data-regrant]').forEach(b => b.addEventListener('click', () => addFolder()));
   el.querySelectorAll('.recent-item[data-i]').forEach(item => {
     const go = () => { const e = shown[Number(item.dataset.i)]; if (e) openEntry(e, e.folderUri); };
     item.addEventListener('click', go);
@@ -225,11 +241,19 @@ function refreshManager() {
 function wireManager() {
   document.querySelectorAll('[data-mgr-remove]').forEach(b => b.addEventListener('click', () => removeFolder(b.dataset.mgrRemove)));
 }
+function managerDiagnostics() {
+  const st = Device.safStatus();
+  if (!st) return '<p style="margin-top:10px;font-size:12px;color:var(--text-tertiary)">Diagnostics unavailable (this build has no folder diagnostics).</p>';
+  return `<details style="margin-top:12px;font-size:12px;color:var(--text-tertiary)"><summary>Folder access diagnostics</summary><pre style="white-space:pre-wrap;word-break:break-all;margin-top:6px">${esc(JSON.stringify(st, null, 2))}</pre></details>`;
+}
+
 function manageFolders() {
-  openModal('PDF Folders on this Device', '<span id="mgr-marker" hidden></span>' + managerBody(),
+  // Nothing granted yet: the useful action is the picker itself, not a list that says "no folders".
+  if (!Device.folders().length) { addFolder({ goToList: true }); return; }
+  openModal('PDF Folders on this Device', '<span id="mgr-marker" hidden></span>' + managerBody() + managerDiagnostics(),
     '<button class="btn btn-secondary" id="mgr-add">Add folder</button><button class="btn btn-primary" id="mgr-done">Done</button>');
   wireManager();
-  document.getElementById('mgr-add')?.addEventListener('click', addFolder);
+  document.getElementById('mgr-add')?.addEventListener('click', () => addFolder());
   document.getElementById('mgr-done')?.addEventListener('click', closeModal);
 }
 
@@ -241,6 +265,7 @@ function wire() {
   document.getElementById('tab-device')?.classList.toggle('hidden', !Device.canBrowseDevice);
   bus.on('ondevice:show', () => { _s.folders = Device.folders(); render(); scanAll(); });
   bus.on('ondevice:manageFolders', manageFolders);
+  bus.on('ondevice:addFolder', () => addFolder());
   bus.on('app:nav', ({ page }) => { if (page !== 'files') _s.ctrl?.abort(); });
 }
 wire();

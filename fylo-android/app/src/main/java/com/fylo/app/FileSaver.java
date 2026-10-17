@@ -129,7 +129,10 @@ final class FileSaver {
                 path = s.file.getAbsolutePath();
                 uri = legacyUri(s.file);
             }
-            return json("ok", true, "name", name, "path", path, "uri", uri, "bytes", actual);
+            String abs = s.media
+                    ? new File(Environment.getExternalStorageDirectory(), path).getAbsolutePath()
+                    : path;
+            return json("ok", true, "name", name, "path", path, "abs", abs, "uri", uri, "bytes", actual);
         } catch (Exception e) {
             Log.e(TAG, "end failed", e);
             discard(s);

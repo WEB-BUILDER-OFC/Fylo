@@ -49,6 +49,7 @@ import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -93,6 +94,15 @@ public class MainActivity extends AppCompatActivity {
     // never arrives (cleanup threw, WebView too old …) it is simply tried again on the next launch.
     private volatile boolean mNeedWebCleanup = false;
     private volatile boolean mReloadedForCleanup = false;     // loop guard: at most one forced reload per process
+    // Results for the page (folder picker answer, scan results) are held until the page has finished loading, so an answer
+    // that arrives while the WebView is (re)loading is delivered afterwards instead of being silently dropped.
+    private volatile boolean mPageReady = false;
+    private final ArrayList<String> mQueuedJs = new ArrayList<>();
+    // Folder-picker diagnostics (shown in Settings -> PDF Folders -> Folder access diagnostics).
+    private volatile int mPickerLaunches = 0;
+    private volatile int mPickerResults = 0;
+    private volatile String mPickerLastEvent = "none";
+    private volatile long mPickerLastEventAt = 0L;
     private static final String PREFS = "fylo_native";
     private static final String PREF_WEB_CLEANED = "web_cleanup_stamp";
     private static int sRendererCrashCount = 0;
@@ -100,6 +110,8 @@ public class MainActivity extends AppCompatActivity {
     // File saving (verified, chunked) and Storage Access Framework PDF browsing.
     private FileSaver mSaver;
     private SafPdfIndex mSaf;
+    private DevicePdfIndex mDevice;
+    private boolean mAwaitingStorageSettings = false;
     private final Map<String, AtomicBoolean> mScans = new ConcurrentHashMap<>();
 
 
@@ -147,6 +159,26 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    // READ_EXTERNAL_STORAGE (API 26-29 only; API 30+ uses the "All files access" Settings screen instead).
+    private final ActivityResultLauncher<String> mStoragePermissionLauncher =
+        registerForActivityResult(new ActivityResultContracts.RequestPermission(),
+            granted -> postStorageState("storageAccess"));
+
+    // "Open PDF" picker that keeps read access to each chosen document, so FYLO can reopen it in place later
+    // instead of copying it into its own storage.
+    private static final class PersistableDocsContract extends ActivityResultContracts.OpenMultipleDocuments {
+        @NonNull
+        @Override
+        public Intent createIntent(@NonNull Context context, @NonNull String[] input) {
+            Intent i = super.createIntent(context, input);
+            i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+            return i;
+        }
+    }
+
+    private final ActivityResultLauncher<String[]> mDocsPicker =
+        registerForActivityResult(new PersistableDocsContract(), this::onDocsPicked);
+
     private final ActivityResultLauncher<Uri> mFolderPicker =
         registerForActivityResult(new PersistableTreeContract(), this::onFolderPicked);
 
@@ -159,6 +191,7 @@ public class MainActivity extends AppCompatActivity {
 
         mSaver = new FileSaver(this);
         mSaf = new SafPdfIndex(this);
+        mDevice = new DevicePdfIndex(this);
 
         mNeedWebCleanup = !installStamp().equals(
                 getSharedPreferences(PREFS, MODE_PRIVATE).getString(PREF_WEB_CLEANED, ""));
@@ -169,6 +202,21 @@ public class MainActivity extends AppCompatActivity {
 
         // Store intent for delivery after app loads
         mPendingIntent = getIntent();
+    }
+
+    /** Returning from the system "All files access" screen: tell the page the (possibly changed) state. */
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (mAwaitingStorageSettings) {
+            mAwaitingStorageSettings = false;
+            postStorageState("storageAccess");
+        }
+    }
+
+    private void postStorageState(String id) {
+        try { postToWeb(id, mDevice.state().toString()); }
+        catch (Exception e) { postToWeb(id, FileSaver.json("granted", false, "error", FileSaver.describe(e))); }
     }
 
     @Override
@@ -246,6 +294,9 @@ public class MainActivity extends AppCompatActivity {
                 if (ASSET_HOST.equals(reqUri.getHost()) && "/saf/doc".equals(reqUri.getPath())) {
                     return serveSafDocument(reqUri);
                 }
+                if (ASSET_HOST.equals(reqUri.getHost()) && "/dev/doc".equals(reqUri.getPath())) {
+                    return serveDevicePdf(reqUri);
+                }
                 WebResourceResponse response =
                         assetLoader.shouldInterceptRequest(request.getUrl());
                 if (response != null) {
@@ -299,6 +350,8 @@ public class MainActivity extends AppCompatActivity {
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
                 sRendererCrashCount = 0;
+                mPageReady = true;
+                flushQueuedJs();
                 if (mNeedWebCleanup) {
                     // Runs inside the page. The result comes back through AndroidBridge.onWebCleanupDone().
                     // Only FYLO's own caches ("fylo-*") are touched — never IndexedDB, files, bookmarks or settings.
@@ -433,7 +486,7 @@ public class MainActivity extends AppCompatActivity {
             String s = req.getQueryParameter("u");
             if (s == null || s.isEmpty()) return httpError(400, "Bad Request");
             Uri doc = Uri.parse(s);
-            if (!mSaf.isUnderGrantedRoot(doc)) return httpError(403, "Forbidden");
+            if (!mSaf.isUnderGrantedRoot(doc) && !mSaf.isGrantedDocument(doc)) return httpError(403, "Forbidden");
             AssetFileDescriptor afd = getContentResolver().openAssetFileDescriptor(doc, "r");
             if (afd == null) return httpError(404, "Not Found");
             Map<String, String> headers = new HashMap<>();
@@ -451,6 +504,45 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    /**
+     * Streams a PDF from its original location (never copied). Two forms:
+     *   /dev/doc?p=<absolute path>   — a shared-storage PDF; needs storage access (or is under FYLO's own dir)
+     *   /dev/doc?u=<content://media/...> — a PDF FYLO itself saved through MediaStore (readable without permission)
+     */
+    private WebResourceResponse serveDevicePdf(Uri req) {
+        try {
+            String p = req.getQueryParameter("p");
+            String u = req.getQueryParameter("u");
+            Map<String, String> headers = new HashMap<>();
+            headers.put("Cache-Control", "no-store");
+            if (p != null && !p.isEmpty()) {
+                if (!mDevice.isPathAllowed(p)) return httpError(403, "Forbidden");
+                if (!mDevice.hasAccess() && !mDevice.isOwnExternalPath(p)) return httpError(403, "Forbidden");
+                java.io.File f = new java.io.File(p);
+                if (!f.isFile()) return httpError(404, "Not Found");
+                headers.put("Content-Length", Long.toString(f.length()));
+                return new WebResourceResponse("application/pdf", null, 200, "OK", headers, new java.io.FileInputStream(f));
+            }
+            if (u != null && !u.isEmpty()) {
+                Uri doc = Uri.parse(u);
+                if (!"content".equals(doc.getScheme()) || !"media".equals(doc.getAuthority())) return httpError(403, "Forbidden");
+                AssetFileDescriptor afd = getContentResolver().openAssetFileDescriptor(doc, "r");
+                if (afd == null) return httpError(404, "Not Found");
+                long len = afd.getLength();
+                if (len >= 0) headers.put("Content-Length", Long.toString(len));
+                return new WebResourceResponse("application/pdf", null, 200, "OK", headers, afd.createInputStream());
+            }
+            return httpError(400, "Bad Request");
+        } catch (SecurityException e) {
+            return httpError(403, "Forbidden");
+        } catch (FileNotFoundException e) {
+            return httpError(404, "Not Found");
+        } catch (Exception e) {
+            Log.e(TAG, "serveDevicePdf failed", e);
+            return httpError(500, "Read Error");
+        }
+    }
+
     private static WebResourceResponse httpError(int code, String reason) {
         return new WebResourceResponse("text/plain", "utf-8", code, reason,
                 new HashMap<String, String>(), new ByteArrayInputStream(new byte[0]));
@@ -460,21 +552,66 @@ public class MainActivity extends AppCompatActivity {
     private void postToWeb(String id, String json) {
         final String js = "window.fyloNativeResult&&window.fyloNativeResult("
                 + JSONObject.quote(id) + "," + JSONObject.quote(json) + ")";
-        runOnUiThread(() -> { if (mWebView != null) mWebView.evaluateJavascript(js, null); });
+        runOnUiThread(() -> {
+            if (mWebView == null) return;
+            if (!mPageReady) {
+                synchronized (mQueuedJs) { mQueuedJs.add(js); }
+                return;
+            }
+            mWebView.evaluateJavascript(js, null);
+        });
+    }
+
+    /** Delivers results that arrived while the page was loading (called once the page has finished). */
+    private void flushQueuedJs() {
+        final ArrayList<String> pending;
+        synchronized (mQueuedJs) {
+            if (mQueuedJs.isEmpty()) return;
+            pending = new ArrayList<>(mQueuedJs);
+            mQueuedJs.clear();
+        }
+        // Let the web app finish booting (module scripts + async init) before handing it the results.
+        mWebView.postDelayed(() -> { for (String js : pending) mWebView.evaluateJavascript(js, null); }, 800);
+    }
+
+    private void notePicker(String event) {
+        mPickerLastEvent = event;
+        mPickerLastEventAt = System.currentTimeMillis();
+        Log.i(TAG, "folder picker: " + event);
+    }
+
+    /** Result of the "Open PDF" document picker → fyloNativeResult("docsPicked", {ok, files:[{uri,name,size,modified,persisted}]}). */
+    private void onDocsPicked(List<Uri> uris) {
+        try {
+            JSONArray arr = new JSONArray();
+            if (uris != null) for (Uri u : uris) {
+                JSONObject o = mSaf.describeDocument(u);
+                o.put("persisted", mSaf.grantDocument(u));
+                arr.put(o);
+            }
+            postToWeb("docsPicked", FileSaver.json("ok", true, "files", arr));
+        } catch (Exception e) {
+            Log.e(TAG, "onDocsPicked failed", e);
+            postToWeb("docsPicked", FileSaver.json("ok", false, "error", FileSaver.describe(e)));
+        }
     }
 
     /** Result of the folder picker. */
     private void onFolderPicked(Uri tree) {
         String json;
+        mPickerResults++;
         try {
             if (tree == null) {
+                notePicker("result: cancelled (no folder chosen)");
                 json = FileSaver.json("ok", false, "cancelled", true);
             } else {
+                notePicker("result: " + tree);
                 JSONObject folder = mSaf.addRoot(tree);
                 json = FileSaver.json("ok", true, "folder", folder);
             }
         } catch (Exception e) {
             Log.e(TAG, "onFolderPicked failed", e);
+            notePicker("result handling failed: " + FileSaver.describe(e));
             json = FileSaver.json("ok", false, "error", FileSaver.describe(e));
         }
         postToWeb("folderPicked", json);
@@ -688,6 +825,7 @@ public class MainActivity extends AppCompatActivity {
                 // Stale caches were just removed: reload so the page is served from the APK's assets.
                 mReloadedForCleanup = true;
                 runOnUiThread(() -> {
+                    mPageReady = false;
                     mWebView.clearCache(true);
                     mWebView.reload();
                 });
@@ -848,11 +986,127 @@ public class MainActivity extends AppCompatActivity {
         public void pickPdfFolder() {
             runOnUiThread(() -> {
                 try {
+                    mPickerLaunches++;
+                    notePicker("launching ACTION_OPEN_DOCUMENT_TREE");
                     mFolderPicker.launch(null);
+                } catch (android.content.ActivityNotFoundException e) {
+                    notePicker("no system folder picker on this device");
+                    postToWeb("folderPicked", FileSaver.json("ok", false, "error",
+                            "This device has no system folder picker (the Files / Documents app may be disabled)."));
                 } catch (Exception e) {
+                    notePicker("launch failed: " + FileSaver.describe(e));
                     postToWeb("folderPicked", FileSaver.json("ok", false, "error", FileSaver.describe(e)));
                 }
             });
+        }
+
+        // ── Device-wide PDF discovery (storage access) ────────────────────────
+
+        /** {sdk, mode: all_files|read_storage, granted}. */
+        @JavascriptInterface
+        public String getStorageAccess() {
+            try { return mDevice.state().toString(); }
+            catch (Exception e) { return FileSaver.json("granted", false, "error", FileSaver.describe(e)); }
+        }
+
+        /**
+         * Asks for access. API 30+: opens the system "All files access" screen for FYLO (this is NOT a popup — the
+         * user flips a switch and comes back; the result arrives via fyloNativeResult("storageAccess", state) when
+         * the app resumes). API 26-29: the normal READ_EXTERNAL_STORAGE runtime dialog.
+         */
+        @JavascriptInterface
+        public void requestStorageAccess() {
+            runOnUiThread(() -> {
+                try {
+                    if (mDevice.hasAccess() || android.os.Build.VERSION.SDK_INT == 29) { postStorageState("storageAccess"); return; }
+                    if (android.os.Build.VERSION.SDK_INT >= 30) {
+                        Intent i = new Intent(android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                                Uri.parse("package:" + getPackageName()));
+                        mAwaitingStorageSettings = true;
+                        try { startActivity(i); }
+                        catch (android.content.ActivityNotFoundException e) {
+                            startActivity(new Intent(android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION));
+                        }
+                    } else {
+                        mStoragePermissionLauncher.launch(android.Manifest.permission.READ_EXTERNAL_STORAGE);
+                    }
+                } catch (Exception e) {
+                    mAwaitingStorageSettings = false;
+                    postToWeb("storageAccess", FileSaver.json("granted", false, "error", FileSaver.describe(e)));
+                }
+            });
+        }
+
+        /** Background discovery. deep=true also walks the file system. Result: fyloNativeResult(requestId, json). */
+        @JavascriptInterface
+        public void discoverPdfs(final String requestId, final boolean deep) {
+            if (requestId == null) return;
+            final AtomicBoolean cancel = new AtomicBoolean(false);
+            mScans.put(requestId, cancel);
+            new Thread(() -> {
+                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
+                String json;
+                try { json = mDevice.discover(deep, cancel).toString(); }
+                catch (Throwable e) { json = FileSaver.json("ok", false, "error", "ERROR", "message", FileSaver.describe(e)); }
+                mScans.remove(requestId);
+                postToWeb(requestId, json);
+            }, "fylo-device-scan").start();
+        }
+
+        /** Opens the system document picker (multi-select) keeping read access to each pick. Result: "docsPicked". */
+        @JavascriptInterface
+        public void pickPdfDocuments() {
+            runOnUiThread(() -> {
+                try { mDocsPicker.launch(new String[]{"application/pdf"}); }
+                catch (Exception e) { postToWeb("docsPicked", FileSaver.json("ok", false, "error", FileSaver.describe(e))); }
+            });
+        }
+
+        /** Drops the saved access to a picked document FYLO no longer lists. */
+        @JavascriptInterface
+        public void releaseDocument(String uri) {
+            if (uri != null && uri.startsWith("content:")) mSaf.releaseDocument(Uri.parse(uri));
+        }
+
+        /** Existence check for known PDFs: JSON array of absolute paths and/or content URIs; result via fyloNativeResult(requestId, json). */
+        @JavascriptInterface
+        public void statPdfs(final String requestId, final String pathsJson) {
+            if (requestId == null) return;
+            new Thread(() -> {
+                String json;
+                try {
+                    JSONArray in = new JSONArray(pathsJson), paths = new JSONArray(), out = new JSONArray();
+                    for (int i = 0; i < in.length(); i++) {
+                        String v = in.optString(i);
+                        if (v.startsWith("content:")) out.put(mSaf.statDocument(v)); else paths.put(v);
+                    }
+                    JSONArray st = mDevice.stat(paths);
+                    for (int i = 0; i < st.length(); i++) out.put(st.get(i));
+                    json = FileSaver.json("ok", true, "items", out);
+                }
+                catch (Throwable e) { json = FileSaver.json("ok", false, "error", FileSaver.describe(e)); }
+                postToWeb(requestId, json);
+            }, "fylo-device-stat").start();
+        }
+
+        /** Diagnostics for the folder picker (JSON). */
+        @JavascriptInterface
+        public String getSafStatus() {
+            try {
+                JSONObject o = new JSONObject();
+                o.put("launches", mPickerLaunches);
+                o.put("results", mPickerResults);
+                o.put("lastEvent", mPickerLastEvent);
+                o.put("lastEventAgeSec", mPickerLastEventAt == 0 ? -1 : (System.currentTimeMillis() - mPickerLastEventAt) / 1000);
+                o.put("persistedGrants", mSaf.persistedGrantCount());
+                o.put("folders", mSaf.foldersJson());
+                o.put("sdk", android.os.Build.VERSION.SDK_INT);
+                o.put("storage", mDevice.state());
+                o.put("pageReady", mPageReady);
+                return o.toString();
+            } catch (Exception e) {
+                return FileSaver.json("error", FileSaver.describe(e));
+            }
         }
 
         /** JSON array of {uri, name, accessible} for the folders the user granted. */

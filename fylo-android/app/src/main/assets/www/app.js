@@ -40,6 +40,7 @@ import { FilesModule }   from './features/files/index.js';
 import { SettingsModule } from './features/settings/index.js';
 import { MenuModule }     from './features/menu/index.js';
 import { Device }         from './core/device.js';
+import { Library }        from './features/files/library.js';
 import { APP_VERSION }    from './core/constants.js';
 
 
@@ -247,7 +248,7 @@ function _wireSearch() {
       if (resultsEl) resultsEl.innerHTML = '';
       return;
     }
-    const filtered = State.files.filter(f => f.name.toLowerCase().includes(q));
+    const filtered = Library.allFiles().filter(f => f.name.toLowerCase().includes(q)).slice(0, 50);
     // Show results in search-results panel
     const resultsEl = document.getElementById('search-results');
     if (resultsEl) {
@@ -317,6 +318,18 @@ function _wireGlobalEvents() {
     const files = [...e.target.files];
     if (files.length) FilesModule.handleFiles(files);
     e.target.value = '';
+  });
+  // Android: the system picker keeps access to each chosen PDF, so it is opened in place (no copy). Anything the
+  // picker can't do falls through to the normal <input type=file> flow above.
+  fileInput?.addEventListener('click', async e => {
+    if (!Device.canPickDocuments) return;
+    e.preventDefault();
+    const r = await Library.pickDocuments();
+    if (r.ok && r.ids?.length) {
+      FilesModule.renderRecent(); FilesModule.renderFiles();
+      if (r.ids.length === 1) bus.emit('files:open', { fileId: r.ids[0] });
+      else toast(`${r.ids.length} PDFs added`);
+    }
   });
   document.getElementById('fab')?.addEventListener('click',
     () => fileInput?.click());

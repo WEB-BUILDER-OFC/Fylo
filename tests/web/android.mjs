@@ -19,13 +19,14 @@ async function pdf2img(p, { fmt = 'png', pages = '', fileIdx = 0 } = {}) {
 // ───────── A. Compress → Save to device (Download/FYLO) ─────────
 { const s = await fresh({}); const p = s.page;
   await menuAction(p, 'compress'); await p.click('[data-compress-file]'); await p.click('#compress-run-btn');
-  await waitTitle(p, /compressed/); await p.click('text=Save to device'); await sleep(1000);
+  await waitTitle(p, /compressed/); await sleep(1200);
+  rec(G('compress'), 'result offers no second "Save to device" (it is already saved once to Download/FYLO)', (await p.locator('text=Save to device').count()) === 0 && /Downloads\/FYLO/.test(await modalText(p)));
   const sv = await saved(p); const f = sv[0];
-  rec(G('compress'), 'Save to device writes exactly one verified PDF under Download/FYLO', sv.length === 1 && f.path.startsWith('Download/FYLO/') && f.mime === 'application/pdf', JSON.stringify(sv));
+  rec(G('compress'), 'compress result is written exactly once, as a verified PDF under Download/FYLO', sv.length === 1 && f.path.startsWith('Download/FYLO/') && f.mime === 'application/pdf', JSON.stringify(sv));
   const out = path.join(OUT, 'android_compressed.pdf'); fs.writeFileSync(out, await dump(p, 0));
   const c = JSON.parse(execFileSync('python3', ['-I', 'check_pdf.py', fx('photos.pdf'), out], { encoding: 'utf8' }));
   rec(G('compress'), 'the bytes handed to the bridge are a valid, smaller PDF', c.qpdf_ok && c.size_new < c.size_orig && c.pages_new === c.pages_orig, JSON.stringify(c));
-  rec(G('compress'), 'toast reports the real path', /Saved to Download\/FYLO\//.test((await p.evaluate(() => window.__toasts)).join('|')), (await p.evaluate(() => window.__toasts)).join(' | '));
+  rec(G('compress'), 'the library keeps a reference to that single file (no second copy)', await p.evaluate(() => new Promise(res => { const r = indexedDB.open('fylo_db'); r.onsuccess = () => { const q = r.result.transaction('files').objectStore('files').getAll(); q.onsuccess = () => res(q.result.some(x => x.ref && !x.blob && /Download\/FYLO\//.test(x.ref.path))); }; })) && true, (await p.evaluate(() => window.__toasts)).join(' | '));
   rec(G('compress'), 'no page errors', s.logs.errors.length === 0, s.logs.errors.join('|'));
   await s.close(); }
 

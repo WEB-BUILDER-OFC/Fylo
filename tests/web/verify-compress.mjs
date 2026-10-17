@@ -16,7 +16,8 @@ for (const n of cases) for (const level of (n === 'photos' ? ['low', 'medium', '
   await importPdfs(p, [n + '.pdf'], 1);
   const txt = await run(p, level);
   const out = path.join(OUT, `${n}_${level}_compressed.pdf`);
-  const o = await blobOf(p, '_compressed');
+  // Android: the result is written once to Download/FYLO (library keeps only a reference), so read it from there.
+  const o = mode === 'android' ? await p.evaluate(() => { const i = window.__fake.saved.findIndex(x => /_compressed/.test(x.name)); return i < 0 ? null : { b64: window.__fake.base64(i) }; }) : await blobOf(p, '_compressed');
   const origRec = await blobOf(p, '^' + n + '\\.pdf$');
   const srcIntact = origRec && crypto.createHash('sha256').update(Buffer.from(origRec.b64, 'base64')).digest('hex') === sha(fx(n + '.pdf'));
   if (!o) { rec(G, `${n}/${level}`, false, 'no compressed file in library: ' + txt.slice(0, 120)); await s.close(); continue; }

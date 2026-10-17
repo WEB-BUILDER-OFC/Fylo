@@ -30,3 +30,6 @@ fylo-android/keystore.properties
 # Generated test fixtures (python3 tests/web/make_fixtures.py)
 tests/web/fixtures/
 tests/web/out/
+
+# …but DO commit the stable signing key that makes APK-over-APK updates work (see app/build.gradle)
+!fylo-android/signing/fylo-signing.keystore

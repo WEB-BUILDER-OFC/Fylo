@@ -18,6 +18,8 @@ import {
 import { Device }        from '../../core/device.js';
 import { compressPdf, LEVELS } from './pdfcompress.js';
 import { FileStorage }   from '../../core/storage.js';
+import { Library }       from '../files/library.js';
+import { blobOf }        from '../../core/deviceblob.js';
 import { createLogger }  from '../../core/logger.js';
 
 const log = createLogger('Tools');
@@ -63,10 +65,11 @@ function pdfDeg(n) {
 async function _saveAndImport(pdfDoc, filename) {
   const bytes = await pdfDoc.save();
   const blob  = new Blob([bytes], { type: 'application/pdf' });
-  downloadBlob(blob, filename);
-  // Also import into FYLO file library
+  // Browser/PWA: a normal download plus the in-app library copy (unchanged). Android: ONE save — handleFiles writes the
+  // PDF to Downloads/FYLO (or FYLO's own storage if the user chose that) and keeps only a reference.
+  if (!Device.isAndroid) downloadBlob(blob, filename);
   const file = new File([blob], filename, { type: 'application/pdf' });
-  bus.emit('files:incoming', { files: [file] });
+  bus.emit('files:incoming', { files: [file], generated: true });
 }
 
 // ── Render page thumbnails in a grid ─────────────────────────────────────────
@@ -412,19 +415,20 @@ async function toolCompress(file, levelKey = State.settings.compressLevel || 'me
   const outName = file.name.replace(/\.pdf$/i, '') + '_compressed.pdf';
   const blob = new Blob([r.bytes], { type: 'application/pdf' });
   const saved = await new Promise(resolve => {
-    bus.emit('files:incoming', { files: [new File([blob], outName, { type: 'application/pdf' })], onSaved: ids => resolve(ids || []) });
+    bus.emit('files:incoming', { files: [new File([blob], outName, { type: 'application/pdf' })], generated: true, onSaved: ids => resolve(ids || []) });
   });
   const stored = saved.length > 0;
+  const inPlace = stored && !!State.getFile(saved[0])?.ref;     // already written once to Downloads/FYLO
   const pct = ((1 - r.newSize / r.originalSize) * 100).toFixed(1);
   const checkList = (r.checks || []).map(c => '✓ ' + esc(c));
   showResult('PDF compressed',
     `<p style="font-size:15px"><strong>${fmtBytes(r.originalSize)} → ${fmtBytes(r.newSize)}</strong> <span style="color:var(--success)">(${pct}% smaller)</span></p>`
     + bullets([...describeImages(r), ...checkList, ...(r.notes || [])])
     + `<p style="margin-top:10px;font-size:13px;color:${stored ? 'var(--text-secondary)' : 'var(--warning)'}">${stored
-        ? `Saved in your FYLO library as <strong>${esc(outName)}</strong>. Your original is unchanged.`
+        ? `Saved ${inPlace ? 'to <strong>Downloads/FYLO</strong>' : 'in your FYLO library'} as <strong>${esc(outName)}</strong>. Your original is unchanged.`
         : 'It could not be stored in the FYLO library (storage unavailable) — use “Save to device” to keep it.'}</p>`,
     [
-      { label: 'Save to device', onClick: () => downloadBlob(blob, outName) },
+      ...(inPlace ? [] : [{ label: 'Save to device', onClick: () => downloadBlob(blob, outName) }]),
       ...(stored ? [{ label: 'Open', primary: true, onClick: () => bus.emit('reader:openRequest', { fileId: saved[0] }) }] : [{ label: 'Done', primary: true }]),
     ]);
 }
@@ -671,8 +675,9 @@ async function toolUnlock(file, password) {
 
 // Shared: build a list of existing FYLO files for selection
 function _fileListHTML(dataProp) {
-  if (!State.files.length) return '<p style="color:var(--text-tertiary);font-size:13px">No PDFs in library. Import a file first.</p>';
-  return State.files.slice(0, 20).map(f =>
+  const _list = Library.pickerList(20);
+  if (!_list.length) return '<p style="color:var(--text-tertiary);font-size:13px">No PDFs in library. Import a file first.</p>';
+  return _list.map(f =>
     `<div class="tool-file-item" data-${dataProp}="${f.id}">
       <div class="recent-thumb" style="width:32px;height:40px">${f.thumbnail
         ? `<img src="${f.thumbnail}" style="width:100%;height:100%;object-fit:cover;border-radius:3px">`
@@ -745,7 +750,7 @@ function showMergeModal() {
 // ── Split modal ───────────────────────────────────────────────
 function showSplitModal() {
   _resetTool('split');
-  if (!State.files.length) { toast('Open a PDF first'); Router.go(PAGES.FILES); return; }
+  if (!Library.count()) { toast('Open a PDF first'); Router.go(PAGES.FILES); return; }
   openModal(
     'Split PDF',
     `<p style="color:var(--text-secondary);margin-bottom:12px">Select a PDF to split:</p>
@@ -797,7 +802,7 @@ function showSplitModal() {
 // ── Rotate modal ──────────────────────────────────────────────
 function showRotateModal() {
   _resetTool('rotate');
-  if (!State.files.length) { toast('Open a PDF first'); Router.go(PAGES.FILES); return; }
+  if (!Library.count()) { toast('Open a PDF first'); Router.go(PAGES.FILES); return; }
   openModal(
     'Rotate Pages',
     `<p style="color:var(--text-secondary);margin-bottom:12px">Select a PDF:</p>
@@ -856,7 +861,7 @@ function showRotateModal() {
 // ── Delete pages modal ────────────────────────────────────────
 function showDeleteModal() {
   _resetTool('delete-pages');
-  if (!State.files.length) { toast('Open a PDF first'); Router.go(PAGES.FILES); return; }
+  if (!Library.count()) { toast('Open a PDF first'); Router.go(PAGES.FILES); return; }
   openModal(
     'Delete Pages',
     `<p style="color:var(--text-secondary);margin-bottom:12px">Select a PDF:</p>
@@ -913,7 +918,7 @@ function showDeleteModal() {
 // ── Reorder pages modal ───────────────────────────────────────
 function showReorderModal() {
   _resetTool('reorder');
-  if (!State.files.length) { toast('Open a PDF first'); Router.go(PAGES.FILES); return; }
+  if (!Library.count()) { toast('Open a PDF first'); Router.go(PAGES.FILES); return; }
   openModal(
     'Reorder Pages',
     `<p style="color:var(--text-secondary);margin-bottom:12px">Select a PDF:</p>
@@ -970,7 +975,7 @@ function showReorderModal() {
 // ── Compress modal ────────────────────────────────────────────
 function showCompressModal() {
   _resetTool('compress');
-  if (!State.files.length) { toast('Open a PDF first'); Router.go(PAGES.FILES); return; }
+  if (!Library.count()) { toast('Open a PDF first'); Router.go(PAGES.FILES); return; }
   openModal(
     'Compress PDF',
     `<p style="color:var(--text-secondary);margin-bottom:12px">Select a PDF to compress:</p>
@@ -1103,7 +1108,7 @@ function showImgToPdfModal() {
 // ── PDF-to-Image modal ────────────────────────────────────────
 function showPdfToImgModal() {
   _resetTool('pdf-to-img');
-  if (!State.files.length) { toast('Open a PDF first'); Router.go(PAGES.FILES); return; }
+  if (!Library.count()) { toast('Open a PDF first'); Router.go(PAGES.FILES); return; }
   openModal(
     'PDF to Image',
     `<p style="color:var(--text-secondary);margin-bottom:12px">Select a PDF to convert:</p>
@@ -1247,7 +1252,7 @@ function showUnlockModal() {
 }
 // ── Editor flow ───────────────────────────────────────────────
 function startEditorFlow(tool) {
-  if (!State.files.length) { toast('Open a PDF first'); Router.go(PAGES.FILES); return; }
+  if (!Library.count()) { toast('Open a PDF first'); Router.go(PAGES.FILES); return; }
   openModal(
     'Select PDF to Edit',
     `<p style="color:var(--text-secondary);margin-bottom:12px">Choose a PDF to edit with <strong>${esc(tool)}</strong>:</p>

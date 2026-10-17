@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <!-- Camera access for document scanning -->
     <uses-permission android:name="android.permission.CAMERA" />
@@ -9,8 +10,16 @@
     <!-- Internet for CDN library fallback (optional — local libs are preferred) -->
     <uses-permission android:name="android.permission.INTERNET" />
 
-    <!-- No storage permission at all: saves go through MediaStore (API 29+) or app-specific storage (API 26-28),
-         and PDFs on the phone are read from folders the user picks via the Storage Access Framework. -->
+    <!-- Storage access for the unified PDF library (all optional — FYLO still works without them):
+         * MANAGE_EXTERNAL_STORAGE ("All files access", API 30+): lets FYLO list PDFs anywhere on shared storage and
+           read them in place. It is a special access the user grants in system Settings, not a runtime popup.
+           FYLO is a sideloaded PDF utility; this permission is not acceptable on Google Play for this purpose,
+           which is why folder-by-folder access (Storage Access Framework) remains as the no-permission fallback.
+         * READ_EXTERNAL_STORAGE (API 26-28 only; Android 10 has neither this nor All-files access for other apps' PDFs, so it uses folders): the classic runtime permission for the same purpose. -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
 
     <application
         android:name=".FyloApplication"

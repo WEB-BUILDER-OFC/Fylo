@@ -456,6 +456,7 @@ function _storeInFiles(file) {
     const t = setTimeout(() => reject(new Error('Saving timed out')), 20000);
     bus.emit('files:incoming', {
       files: [file],
+      generated: true,
       requirePersist: true,        // a scan must really be stored, otherwise keep the pages and let the user retry
       onSaved: ids => { clearTimeout(t); ids && ids.length ? resolve(ids[0]) : reject(new Error('Could not save to Files')); },
     });

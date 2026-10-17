@@ -63,6 +63,10 @@ export async function exportBackup({ signal, onProgress = () => {} } = {}) {
   catch (e) { failures.push({ item: 'settings', reason: e?.message || String(e) }); }
 
   const favIds = new Set((settings.find(s => s.key === 'favorites')?.value) || []);
+  // PDFs FYLO only references (on the phone / in Downloads/FYLO) are not duplicated into the backup: they already live
+  // in shared storage. Their metadata (and where they are) is recorded in files.json.
+  const refs = files.filter(f => f.ref);
+  files = files.filter(f => !f.ref);
   const totalBytes = files.reduce((n, f) => n + (f.blob?.size || 0), 0);
 
   // 2 ── can it fit? ─────────────────────────────────────────────────────────────────────────────────────────
@@ -116,8 +120,10 @@ export async function exportBackup({ signal, onProgress = () => {} } = {}) {
     onProgress({ done: files.length, total: files.length, name: 'Finishing…' });
 
     // 5 ── metadata ───────────────────────────────────────────────────────────────────────────────────────────
-    const counts = { pdfsInLibrary: files.length, pdfsExported: exported, pdfsFailed: files.length - exported,
+    const counts = { pdfsInLibrary: files.length, pdfsReferencedInPlace: refs.length, pdfsExported: exported, pdfsFailed: files.length - exported,
                      bookmarkedDocuments: bookmarks.length, settings: settings.length };
+    for (const f of refs) meta.push({ id: f.id, name: f.name, size: f.size, type: f.type, lastModified: f.lastModified, date: f.date,
+      favorite: favIds.has(f.id), zipPath: null, storedOnDevice: true, reference: f.ref.kind === 'saf' ? { kind: 'document', uri: f.ref.uri } : { kind: 'file', path: f.ref.path || null } });
     await zip.addFile('files.json', json(meta));
     await zip.addFile('bookmarks.json', json(bookmarks));
     await zip.addFile('settings.json', json(settings));

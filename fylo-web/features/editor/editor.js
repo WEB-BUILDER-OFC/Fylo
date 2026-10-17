@@ -22,6 +22,7 @@ import { PAGES, EDITOR_HIGHLIGHT_COLORS, EDITOR_DEFAULT_COLOR, EDITOR_DEFAULT_ST
   from '../../core/constants.js';
 import { toast, downloadBlob, openModal, closeModal, generateId } from '../../core/ui.js';
 import { createLogger } from '../../core/logger.js';
+import { Device } from '../../core/device.js';
 
 const log = createLogger('Editor');
 
@@ -286,7 +287,7 @@ function destroyEditor() {
 }
 
 async function openEditor(fileId, tool='select') {
-  const file = State.files.find(f=>f.id===fileId);
+  const file = State.getFile(fileId);
   if (!file)      { toast('File not found'); return; }
   if (!file.blob) { toast('File data unavailable'); return; }
   if (!await Libs.waitForPdfJs()) { toast('PDF.js not loaded.'); return; }
@@ -679,7 +680,7 @@ function redoEditor(){if(!_es.redoStack.length){toast('Nothing to redo');return;
 // ── Save pipeline ─────────────────────────────────────────────────────────────
 async function saveEditor(){
   if(!_es.pdf){toast('No PDF loaded');return;}
-  const file=State.files.find(f=>f.id===_es.docId);
+  const file=State.getFile(_es.docId);
   if(!file?.blob){toast('File data unavailable');return;}
   if(!await Libs.waitForPdfLib()){toast('PDF-Lib not loaded.');return;}
   if(!_es.annotations.length){toast('No annotations to save');return;}
@@ -746,9 +747,9 @@ async function saveEditor(){
     const bytes=await pdfDoc.save();
     const blob=new Blob([bytes],{type:'application/pdf'});
     const outName=file.name.replace(/\.pdf$/i,'_annotated.pdf');
-    downloadBlob(blob,outName);
-    bus.emit('files:incoming',{files:[new File([blob],outName,{type:'application/pdf'})]});
-    toast('Saved & downloaded!');
+    if(!Device.isAndroid)downloadBlob(blob,outName);
+    bus.emit('files:incoming',{files:[new File([blob],outName,{type:'application/pdf'})],generated:true});
+    toast(Device.isAndroid?'Saved as a new PDF (your original is unchanged)':'Saved & downloaded!');
   }catch(err){console.error('Save failed:',err);toast('Save failed: '+err.message);}
 }
 

@@ -7,7 +7,7 @@
 export const APP_NAME    = 'FYLO';
 // Single source of truth for the release version. fylo-android/app/build.gradle reads THIS line to derive
 // versionName and versionCode, and the service worker takes its cache name from it — bump it for every release.
-export const APP_VERSION = '2.1.0';
+export const APP_VERSION = '2.2.0';
 
 // PDF library versions
 export const PDFJS_VERSION  = '3.11.174';

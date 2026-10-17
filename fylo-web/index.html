@@ -238,12 +238,14 @@
     <section class="page page-files" id="page-files">
       <div class="page-content">
         <div class="files-tabs">
+          <button class="file-tab hidden" data-tab="all" id="tab-all">All PDFs</button>
           <button class="file-tab active" data-tab="recent">Recent</button>
           <button class="file-tab" data-tab="favorites">Favorites</button>
           <button class="file-tab" data-tab="offline">Offline</button>
           <button class="file-tab hidden" data-tab="device" id="tab-device">On Device</button>
         </div>
         <div class="files-content" id="files-content">
+          <div id="library-bar" class="hidden"></div>
           <div class="empty-state" id="files-empty">
             <div class="empty-icon"><svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg></div>
             <h3>No files yet</h3><p>Open a PDF to see it here</p>
@@ -297,6 +299,17 @@
         </div>
         <div class="settings-group">
           <h3 class="settings-group-title">Storage</h3>
+          <div class="setting-item clickable hidden" id="setting-access" role="button" tabindex="0">
+            <div class="setting-info"><span class="setting-label">PDFs on this phone</span><span class="setting-desc" id="setting-access-desc">Let FYLO list your phone’s PDFs</span></div>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>
+          </div>
+          <div class="setting-item hidden" id="setting-saveloc">
+            <div class="setting-info"><label class="setting-label" for="setting-save-location">Save new PDFs to</label><span class="setting-desc">Where scans and tool results are kept</span></div>
+            <select class="select-field setting-select" id="setting-save-location">
+              <option value="shared">Downloads/FYLO</option>
+              <option value="private">Inside FYLO only</option>
+            </select>
+          </div>
           <div class="setting-item clickable hidden" id="setting-folders" role="button" tabindex="0">
             <div class="setting-info"><span class="setting-label">PDF Folders on this Device</span><span class="setting-desc" id="setting-folders-desc">Choose folders FYLO may list PDFs from</span></div>
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>

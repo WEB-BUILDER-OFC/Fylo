@@ -96,8 +96,14 @@ final class SafPdfIndex {
         JSONObject o = new JSONObject();
         o.put("uri", tree.toString());
         o.put("name", nameOf(tree));
-        o.put("accessible", isGranted(tree) && rootExists(tree));
+        // "accessible" = Android still holds our grant. (Whether the folder still exists is learnt when it is listed;
+        // a flaky provider query here used to mark a perfectly good new folder as "access lost".)
+        o.put("accessible", isGranted(tree));
         return o;
+    }
+
+    int persistedGrantCount() {
+        try { return cr.getPersistedUriPermissions().size(); } catch (Exception e) { return -1; }
     }
 
     private boolean isGranted(Uri tree) {
@@ -178,6 +184,78 @@ final class SafPdfIndex {
         return false;
     }
 
+    // ── Individually picked documents (the "Open PDF" picker) ────────────────
+
+    /** Documents picked this session (covers grants that could not be persisted). */
+    private final java.util.Set<String> sessionDocs = new java.util.HashSet<>();
+
+    /** Remembers a picked document and tries to keep read access across restarts. Returns true when persisted. */
+    boolean grantDocument(Uri doc) {
+        synchronized (sessionDocs) { sessionDocs.add(doc.toString()); }
+        try {
+            cr.takePersistableUriPermission(doc, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            return true;
+        } catch (SecurityException e) {
+            Log.w(TAG, "Could not persist document permission", e);
+            return false;
+        }
+    }
+
+    boolean isGrantedDocument(Uri doc) {
+        if (doc == null || !"content".equals(doc.getScheme())) return false;
+        synchronized (sessionDocs) { if (sessionDocs.contains(doc.toString())) return true; }
+        try {
+            for (UriPermission p : cr.getPersistedUriPermissions()) {
+                if (p.isReadPermission() && p.getUri().equals(doc)) return true;
+            }
+        } catch (Exception ignored) { /* treated as not granted */ }
+        return false;
+    }
+
+    /** Frees the persisted grant of a document FYLO no longer lists (Android caps how many an app may hold). */
+    void releaseDocument(Uri doc) {
+        synchronized (sessionDocs) { sessionDocs.remove(doc.toString()); }
+        // Never release a grant that is the folder root of a granted tree.
+        if (readRoots().contains(doc.toString())) return;
+        try { cr.releasePersistableUriPermission(doc, Intent.FLAG_GRANT_READ_URI_PERMISSION); } catch (Exception ignored) { /* none */ }
+    }
+
+    /** Describes a picked document: {uri,name,size,modified}. */
+    JSONObject describeDocument(Uri doc) throws JSONException {
+        JSONObject o = new JSONObject();
+        o.put("uri", doc.toString());
+        String name = null; long size = -1, mod = 0;
+        try (Cursor c = cr.query(doc, new String[]{android.provider.OpenableColumns.DISPLAY_NAME,
+                android.provider.OpenableColumns.SIZE, DocumentsContract.Document.COLUMN_LAST_MODIFIED}, null, null, null)) {
+            if (c != null && c.moveToFirst()) {
+                name = c.getString(0);
+                if (!c.isNull(1)) size = c.getLong(1);
+                if (c.getColumnCount() > 2 && !c.isNull(2)) mod = c.getLong(2);
+            }
+        } catch (Exception e) { Log.w(TAG, "describeDocument failed: " + e); }
+        o.put("name", name != null ? name : "document.pdf");
+        o.put("size", size);
+        o.put("modified", mod);
+        return o;
+    }
+
+    /** Existence check for a document/URI the app was granted: {path:<uri>, allowed, exists, size, modified}. */
+    JSONObject statDocument(String uriStr) throws JSONException {
+        Uri doc = Uri.parse(uriStr);
+        JSONObject o = new JSONObject();
+        o.put("path", uriStr);
+        boolean allowed = isGrantedDocument(doc) || isUnderGrantedRoot(doc) || "media".equals(doc.getAuthority());
+        o.put("allowed", allowed);
+        boolean exists = false; long size = 0, mod = 0;
+        if (allowed) {
+            try (Cursor c = cr.query(doc, new String[]{android.provider.OpenableColumns.SIZE}, null, null, null)) {
+                if (c != null && c.moveToFirst()) { exists = true; if (!c.isNull(0)) size = c.getLong(0); }
+            } catch (Exception ignored) { /* gone */ }
+        }
+        o.put("exists", exists); o.put("size", size); o.put("modified", mod);
+        return o;
+    }
+
     // ── PDF listing ───────────────────────────────────────────────────────────
 
     private static final class Node {
@@ -225,7 +303,9 @@ final class SafPdfIndex {
                         DocumentsContract.Document.COLUMN_SIZE,
                         DocumentsContract.Document.COLUMN_LAST_MODIFIED}, null, null, null)) {
                     if (c == null) {
-                        if (node.depth == 0) return failure(out, "UNREADABLE", "This folder could not be read");
+                        if (node.depth == 0) return rootExists(tree)
+                                ? failure(out, "UNREADABLE", "This folder could not be read")
+                                : failure(out, "ACCESS_REVOKED", "This folder no longer exists or its storage was removed");
                         unreadableDirs++;
                         continue;
                     }
@@ -259,7 +339,9 @@ final class SafPdfIndex {
                 } catch (SecurityException e) {
                     return failure(out, "ACCESS_REVOKED", "Access to this folder was removed");
                 } catch (Exception e) {
-                    if (node.depth == 0) return failure(out, "UNREADABLE", FileSaver.describe(e));
+                    if (node.depth == 0) return rootExists(tree)
+                            ? failure(out, "UNREADABLE", FileSaver.describe(e))
+                            : failure(out, "ACCESS_REVOKED", "This folder no longer exists or its storage was removed");
                     unreadableDirs++;
                     Log.w(TAG, "Skipping unreadable folder", e);
                 }

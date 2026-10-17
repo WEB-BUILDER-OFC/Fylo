@@ -70,6 +70,13 @@ export async function open(browser, mode, cfg = {}) {
       if (rel.startsWith('assets/libs/pdf.worker')) return r.fulfill({ body: '/**/', contentType: 'text/javascript' });
       fs.existsSync(f) && fs.statSync(f).isFile() ? r.fulfill({ body: fs.readFileSync(f), contentType: mime(f), headers: { 'cache-control': 'no-store' } }) : r.fulfill({ status: 404, body: 'nf' });
     });
+    // Simulated native /dev/doc for PDFs FYLO itself saved through MediaStore (content://media/… → the fake bridge's saved bytes).
+    await ctx.route(/appassets\.androidplatform\.net\/dev\/doc/, async r => {
+      const u = new URL(r.request().url()).searchParams.get('u');
+      const i = u ? await page.evaluate(u => window.__fake.saved.findIndex(f => f.uri === u && !f.deleted), u) : -1;
+      if (i < 0) return r.fulfill({ status: 404, body: 'gone' });
+      r.fulfill({ status: 200, contentType: 'application/pdf', body: Buffer.from(await page.evaluate(i => window.__fake.base64(i), i), 'base64') });
+    });
     await ctx.route(/appassets\.androidplatform\.net\/__pdfjs\//, r => { const n = r.request().url().split('/__pdfjs/')[1].split('?')[0]; r.fulfill({ body: pdfjsFile(n), contentType: 'text/javascript' }); });
   } else {
     server = await serve(WEB); url = server.url;

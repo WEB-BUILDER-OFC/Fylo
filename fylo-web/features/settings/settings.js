@@ -30,11 +30,13 @@ export async function loadSettings() {
     const motion = await SettingsStorage.load('reduceMotion');
     const level  = await SettingsStorage.load('compressLevel');
     const imgFmt = await SettingsStorage.load('imageFormat');
+    const saveLoc = await SettingsStorage.load('saveLocation');
     Actions.updateSettings({
       darkMode:      dark   ?? true,
       reduceMotion:  motion ?? false,
       compressLevel: COMPRESS_LEVELS.includes(level) ? level : 'medium',
       imageFormat:   imgFmt === 'jpg' ? 'jpg' : 'png',
+      saveLocation:  saveLoc === 'private' ? 'private' : 'shared',
     });
     _applyTheme(State.settings.darkMode);
     _applyReduceMotion(State.settings.reduceMotion);
@@ -74,6 +76,11 @@ export function renderSettings() {
   const fmt = document.getElementById('setting-image-format');
   if (lvl) lvl.value = s.compressLevel || 'medium';
   if (fmt) fmt.value = s.imageFormat || 'png';
+  const sl = document.getElementById('setting-save-location');
+  if (sl) sl.value = s.saveLocation || 'shared';
+  document.getElementById('setting-saveloc')?.classList.toggle('hidden', !Device.isAndroid);
+  document.getElementById('setting-access')?.classList.toggle('hidden', !Device.isAndroid);
+  bus.emit('library:describeAccess', {});
   document.getElementById('setting-folders')?.classList.toggle('hidden', !Device.canBrowseDevice);
   if (Device.canBrowseDevice) {
     const n = Device.folders().length;
@@ -218,6 +225,15 @@ export function wireSettingsEvents() {
     Actions.updateSettings({ imageFormat: v });
     try { await SettingsStorage.save('imageFormat', v); } catch { toast('Could not save this setting'); }
   });
+
+  document.getElementById('setting-save-location')?.addEventListener('change', async e => {
+    const v = e.target.value === 'private' ? 'private' : 'shared';
+    Actions.updateSettings({ saveLocation: v });
+    try { await SettingsStorage.save('saveLocation', v); } catch { toast('Could not save this setting'); }
+  });
+  const _acc = document.getElementById('setting-access');
+  _acc?.addEventListener('click', () => bus.emit('library:manageAccess', {}));
+  _acc?.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); bus.emit('library:manageAccess', {}); } });
 
   // Install prompt — HTML id: install-btn, install-close
   document.getElementById('install-btn')?.addEventListener('click', async () => {

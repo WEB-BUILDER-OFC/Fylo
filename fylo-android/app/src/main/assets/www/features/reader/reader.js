@@ -19,6 +19,7 @@ import {
   formatFileSize, formatDate, generateId, ripple
 } from '../../core/ui.js';
 import { createLogger } from '../../core/logger.js';
+import { blobOf } from '../../core/deviceblob.js';
 
 const log = createLogger('Reader');
 
@@ -95,7 +96,7 @@ function destroyReader(){
 
 async function openReader(fileId){
   destroyReader();
-  const file = State.files.find(f=>f.id===fileId);
+  const file = State.getFile(fileId);
   if(!file){toast('File not found');return;}
   if(!file.blob){toast('File data unavailable');return;}
   _rs.docId=fileId;
@@ -103,7 +104,15 @@ async function openReader(fileId){
   Router.go(PAGES.READER);
   toast('Loading PDF...');
   try{
-    const arrayBuffer = await file.blob.arrayBuffer();
+    let arrayBuffer;
+    try { arrayBuffer = await file.blob.arrayBuffer(); }
+    catch(readErr){
+      // A file kept in place can be gone / un-readable (moved, deleted, permission revoked): say so and go back.
+      destroyReader();
+      toast(readErr.code==='NOT_FOUND'?'This PDF was moved or deleted.':readErr.code==='ACCESS_REVOKED'?'FYLO no longer has access to this PDF.':(readErr.message||'Could not read this PDF'),5000);
+      Router.go(PAGES.FILES);bus.emit('library:refresh',{});
+      return;
+    }
     if(_rs.docId!==fileId||State.page!=='reader')return;
     if(!await Libs.waitForPdfJs()){toast('PDF.js not loaded. Check your internet connection.');return;}
     let pdf;
@@ -720,7 +729,7 @@ function parsePdfDate(d){
 }
 
 async function showFileInfo(){
-  const file=State.files.find(f=>f.id===_rs.docId);if(!file)return;
+  const file=State.getFile(_rs.docId);if(!file)return;
   const pdf=_rs.pdf;if(!pdf)return;
   let info;
   try{info=await pdf.getMetadata();}catch(e){info={info:{}};}
@@ -730,7 +739,7 @@ async function showFileInfo(){
 
 // Reader More Menu
 function showReaderMenu(){
-  const file=State.files.find(f=>f.id===_rs.docId);if(!file)return;
+  const file=State.getFile(_rs.docId);if(!file)return;
   openModal('Options','<div style="display:flex;flex-direction:column;gap:8px">'+
     '<button class="btn btn-secondary" id="menu-print" style="justify-content:flex-start"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg> Print</button>'+
     '<button class="btn btn-secondary" id="menu-share" style="justify-content:flex-start"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"/><polyline points="16 6 12 2 8 6"/><line x1="12" y1="2" x2="12" y2="15"/></svg> Share</button>'+
@@ -738,8 +747,8 @@ function showReaderMenu(){
     '<button class="btn btn-danger" id="menu-delete" style="justify-content:flex-start"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg> Delete</button>'+
   '</div>');
   $('#menu-print').addEventListener('click',()=>{window.print();closeModal();});
-  $('#menu-share').addEventListener('click',async()=>{closeModal();if(navigator.share){try{await navigator.share({title:file.name,files:[file.blob]});}catch(e){}}else{toast('Share not supported');}});
-  $('#menu-download').addEventListener('click',()=>{closeModal();downloadBlob(file.blob,file.name);toast('Downloading...');});
+  $('#menu-share').addEventListener('click',async()=>{closeModal();if(navigator.share){try{await navigator.share({title:file.name,files:[new File([await blobOf(file)],file.name,{type:'application/pdf'})]});}catch(e){}}else{toast('Share not supported');}});
+  $('#menu-download').addEventListener('click',async()=>{closeModal();try{downloadBlob(await blobOf(file),file.name);toast('Downloading...');}catch(e){toast(e.message||'Could not read the file');}});
   $('#menu-delete').addEventListener('click',()=>{closeModal();const fid=file.id;if(_rs.docId===fid)destroyReader();deleteFile(fid);Router.go(PAGES.FILES);});
 }
 

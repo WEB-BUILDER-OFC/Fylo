@@ -27,8 +27,10 @@ const _state = {
     compressLevel: 'medium',   // default for the Compress tool: low | medium | high
     imageFormat:   'png',      // default for PDF to Image: png | jpg
     language:      'en',
+    saveLocation:  'shared',   // where NEW PDFs made by FYLO go on Android: 'shared' (Download/FYLO) | 'private' (inside FYLO)
   },
   db:           null,
+  resolver:     null,
   installPrompt: null,
 };
 
@@ -43,7 +45,8 @@ export const State = {
 
   getBookmarks(fileId)  { return _state.bookmarks[fileId] ?? new Set(); },
   isFavorite(fileId)    { return _state.favorites.has(fileId); },
-  getFile(fileId)       { return _state.files.find(f => f.id === fileId) ?? null; },
+  getFile(fileId)       { return _state.files.find(f => f.id === fileId) ?? (_state.resolver ? _state.resolver(fileId) : null) ?? null; },
+  setResolver(fn)       { _state.resolver = fn; },
   getAllFiles()          { return [..._state.files]; },
 };
 

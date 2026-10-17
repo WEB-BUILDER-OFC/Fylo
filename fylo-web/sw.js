@@ -27,6 +27,7 @@ const STATIC_ASSETS = [
   './core/libs.js',
   './core/device.js',
   './core/zip.js',
+  './core/deviceblob.js',
   // Feature entry points
   './features/reader/index.js',
   './features/editor/index.js',
@@ -46,6 +47,7 @@ const STATIC_ASSETS = [
   './features/settings/backup.js',
   './features/menu/menu.js',
   './features/files/ondevice.js',
+  './features/files/library.js',
   './features/tools/pdfcompress.js',
   // Assets
   './assets/css/main.css',

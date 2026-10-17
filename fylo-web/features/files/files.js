@@ -18,6 +18,9 @@ import {
   formatFileSize, formatDate, generateId, ripple, downloadBlob, $
 } from '../../core/ui.js';
 import { createLogger } from '../../core/logger.js';
+import { Device } from '../../core/device.js';
+import { DeviceBlob } from '../../core/deviceblob.js';
+import { Library, keyOf, stableId } from './library.js';
 import './ondevice.js';          // registers the On Device tab (bus: ondevice:show / ondevice:manageFolders)
 
 const log = createLogger('Files');
@@ -50,6 +53,20 @@ async function handleFiles(files, opts = {}) {
     if (file.type !== 'application/pdf' && !file.name.endsWith('.pdf')) {
       toast('Only PDF files supported'); continue;
     }
+    // New PDF made by FYLO on Android: write it ONCE to Downloads/FYLO (visible in other apps too) and keep only a
+    // reference — no second copy inside FYLO. Falls back to FYLO's own storage if the save fails.
+    if (opts.generated && Device.isAndroid && State.settings.saveLocation !== 'private') {
+      const res = await Device.saveBlob(file, file.name, { kind: 'download', subdir: '', mime: 'application/pdf' });
+      if (res.ok && res.verified && (res.abs || res.path)) {
+        const ref = { kind: 'media', uri: res.uri, path: res.abs || res.path };
+        const rec = Library.addSavedRecord({ name: res.name || file.name, size: res.bytes ?? file.size, lastModified: file.lastModified, ref });
+        try { await FileStorage.save(State.getFile(rec.id)); savedIds.push(rec.id); } catch (e) { notPersisted++; log.warn('Could not persist record:', e); }
+        addedCount++;
+        generateThumb(State.getFile(rec.id)).catch(() => {});
+        continue;
+      }
+      toast('Could not save to Downloads/FYLO (' + (res.error || 'unknown') + ') — kept inside FYLO instead', 4500);
+    }
     const existingIdx = State.files.findIndex(
       f => f.name === file.name && f.size === file.size && f.lastModified === file.lastModified
     );
@@ -71,7 +88,8 @@ async function handleFiles(files, opts = {}) {
         date: new Date().toISOString(), blob: file, thumbnail: null, offline: true,
       };
       Actions.addFile(f);
-      if (State.files.length > 100) Actions.setFiles(State.files.slice(0,100));
+      // Cap only copies held inside FYLO; references are tiny metadata records.
+      { const held = State.files.filter(x => !x.ref); if (held.length > 100) { const drop = new Set(held.slice(100).map(x => x.id)); Actions.setFiles(State.files.filter(x => !drop.has(x.id))); } }
       try { await FileStorage.save(f); savedIds.push(f.id); }
       catch(e) {
         log.warn('Could not persist file:', e);
@@ -93,15 +111,17 @@ async function handleFiles(files, opts = {}) {
 // ── Thumbnail generation ─────────────────────────────────────────────────────
 async function generateThumb(file) {
   if (!file || !file.blob || file.thumbnail) return;
+  if (file.ref && file.size > 40 * 1024 * 1024) return;     // never pull a huge in-place file into memory for a preview
   if (!await Libs.waitForPdfJs()) return;
+  let pdf = null, c = null;
   try {
     // A PDF's xref/trailer is at the END of the file, so a truncated slice cannot be parsed. Image-heavy
     // PDFs (scans) are routinely > 1 MB, which left them without a thumbnail. Read whole files up to 40 MB.
     const ab  = await (file.blob.size <= 40 * 1024 * 1024 ? file.blob : file.blob.slice(0, 1024 * 1024)).arrayBuffer();
-    const pdf  = await Libs.pdfjs.getDocument({ data: ab }).promise;
+    pdf = await Libs.pdfjs.getDocument({ data: ab }).promise;
     const page = await pdf.getPage(1);
     const vp   = page.getViewport({ scale: 0.3 });
-    const c    = document.createElement('canvas');
+    c = document.createElement('canvas');
     c.width = vp.width; c.height = vp.height;
     await page.render({ canvasContext: c.getContext('2d'), viewport: vp }).promise;
     const thumb = c.toDataURL('image/jpeg', 0.6);
@@ -110,14 +130,16 @@ async function generateThumb(file) {
     if (updated) try { await FileStorage.save(updated); } catch(e) {}
     renderRecent(); renderFiles();
   } catch(e) { log.warn('Thumb generation failed:', e); }
+  finally { if (c) { c.width = 0; c.height = 0; } try { await pdf?.destroy?.(); } catch { /* released */ } }
 }
 
 // ── File actions ─────────────────────────────────────────────────────────────
 async function deleteFile(id) {
-  Actions.removeFile(id);
-  try { await FileStorage.remove(id); } catch(e) {}
+  const ref = State.getFile(id)?.ref;
+  if (ref) await Library.forget(id);      // reference only — the PDF on the phone is never deleted by FYLO
+  else { Actions.removeFile(id); try { await FileStorage.remove(id); } catch(e) {} }
   renderRecent(); renderFiles(); updateStorage();
-  toast('File deleted');
+  toast(ref ? 'Removed from FYLO (the PDF is still on your phone)' : 'File deleted');
 }
 
 function toggleFav(id) {
@@ -177,7 +199,7 @@ function renderRecent() {
   el.querySelectorAll('[data-file]').forEach(item => {
     item.addEventListener('click', e => {
       if (e.target.closest('[data-fav]')) return;
-      bus.emit('reader:openRequest', { fileId: item.dataset.file });
+      openFile(item.dataset.file);
     });
   });
   el.querySelectorAll('[data-fav]').forEach(btn => {
@@ -193,6 +215,7 @@ function renderFiles(filteredFiles) {
     const onDevice = tab === 'device';
     const wasHidden = odPanel.classList.contains('hidden');
     odPanel.classList.toggle('hidden', !onDevice);
+    document.getElementById('library-bar')?.classList.add('hidden');
     if (onDevice) {
       document.getElementById('files-empty')?.classList.add('hidden');
       document.getElementById('files-list')?.classList.add('hidden');
@@ -200,19 +223,24 @@ function renderFiles(filteredFiles) {
       return;
     }
   }
+  const isAll = tab === 'all';
+  const bar = document.getElementById('library-bar');
+  if (bar) bar.classList.toggle('hidden', !isAll);
   let files       = filteredFiles ?? (
+    isAll               ? pageOfAll() :
     tab === 'favorites' ? State.files.filter(f => State.isFavorite(f.id)) :
     tab === 'offline'   ? State.files.filter(f => f.offline) :
                           State.files
   );
 
+  if (bar && isAll) renderLibraryBar(bar);      // after the list was computed so its count is current
   const elEmpty = document.getElementById('files-empty');
   const elList  = document.getElementById('files-list');
   if (!elEmpty || !elList) return;
 
   elEmpty.classList.toggle('hidden', files.length > 0);
   elList.classList.toggle('hidden', files.length === 0);
-  if (!files.length) { elList.innerHTML = ''; return; }
+  if (!files.length) { elList.innerHTML = ''; if (isAll) elEmpty.classList.add('hidden'); return; }
 
   elList.innerHTML = files.map(f => {
     const isFav = State.isFavorite(f.id);
@@ -220,25 +248,25 @@ function renderFiles(filteredFiles) {
       <div class="recent-thumb">${f.thumbnail ? `<img src="${f.thumbnail}" alt="">` : '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>'}</div>
       <div class="recent-info">
         <span class="recent-name" title="${esc(f.name)}">${esc(f.name)}</span>
-        <span class="recent-meta">${fmtBytes(f.size)} &middot; ${timeAgo(f.date)}</span>
+        <span class="recent-meta">${fmtBytes(f.size)} &middot; ${timeAgo(f.date)}${Device.isAndroid ? ' &middot; ' + esc(Library.locationLabel(f)) : ''}${f.missing ? ' &middot; <strong style="color:var(--danger,#e5484d)">Missing</strong>' : f.noAccess ? ' &middot; <strong style="color:var(--danger,#e5484d)">No access</strong>' : ''}</span>
       </div>
       <div class="recent-actions">
         <button class="recent-action" data-read="${f.id}" title="Read"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></button>
         <button class="recent-action" data-edit="${f.id}" title="Edit"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button>
         <button class="recent-fav ${isFav?'active':''}" data-fav="${f.id}" title="Favorite"><svg width="16" height="16" viewBox="0 0 24 24" fill="${isFav?'currentColor':'none'}" stroke="currentColor" stroke-width="2"><path d="m19 21-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v16z"/></svg></button>
-        <button class="recent-action" data-delete="${f.id}" title="Delete"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg></button>
+        ${f._virtual ? '' : `<button class="recent-action" data-delete="${f.id}" title="${f.ref ? 'Remove from FYLO' : 'Delete'}"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg></button>`}
       </div>
     </div>`;
-  }).join('');
+  }).join('') + moreButton();
 
   elList.querySelectorAll('[data-file]').forEach(item => {
     item.addEventListener('click', e => {
       if (e.target.closest('button')) return;
-      bus.emit('reader:openRequest', { fileId: item.dataset.file });
+      openFile(item.dataset.file);
     });
   });
   elList.querySelectorAll('[data-read]').forEach(btn => {
-    btn.addEventListener('click', e => { e.stopPropagation(); bus.emit('reader:openRequest', { fileId: btn.dataset.read }); });
+    btn.addEventListener('click', e => { e.stopPropagation(); openFile(btn.dataset.read); });
   });
   elList.querySelectorAll('[data-edit]').forEach(btn => {
     btn.addEventListener('click', e => { e.stopPropagation(); bus.emit('editor:openRequest', { fileId: btn.dataset.edit }); });
@@ -249,13 +277,99 @@ function renderFiles(filteredFiles) {
   elList.querySelectorAll('[data-delete]').forEach(btn => {
     btn.addEventListener('click', e => {
       e.stopPropagation();
-      openModal('Delete File', `<p>Delete <strong>${esc(State.getFile(btn.dataset.delete)?.name ?? '')}</strong>? This cannot be undone.</p>`,
-        `<button class="btn btn-secondary modal-cancel">Cancel</button><button class="btn btn-primary" id="confirm-delete-btn">Delete</button>`);
+      const _f = State.getFile(btn.dataset.delete);
+      openModal(_f?.ref ? 'Remove from FYLO' : 'Delete File',
+        _f?.ref ? `<p>Remove <strong>${esc(_f.name)}</strong> from FYLO’s list? The PDF itself stays where it is on your phone.</p>`
+                : `<p>Delete <strong>${esc(_f?.name ?? '')}</strong>? This cannot be undone.</p>`,
+        `<button class="btn btn-secondary modal-cancel">Cancel</button><button class="btn btn-primary" id="confirm-delete-btn">${_f?.ref ? 'Remove' : 'Delete'}</button>`);
       document.getElementById('confirm-delete-btn').addEventListener('click', () => { closeModal(); deleteFile(btn.dataset.delete); });
       document.querySelector('.modal-cancel')?.addEventListener('click', closeModal);
     });
   });
 }
+
+// ── Unified library (All tab) ────────────────────────────────────────────────
+const PAGE = 100;
+const MAX_OPEN_BYTES = 300 * 1024 * 1024;
+const _lib = { q: '', shown: PAGE, sort: 'recent' };
+let _allCache = null;
+function sortedAll() {
+  const q = _lib.q.trim().toLowerCase();
+  let l = Library.allFiles();
+  if (q) l = l.filter(f => f.name.toLowerCase().includes(q) || (f.ref?.path || '').toLowerCase().includes(q));
+  l = l.slice();
+  l.sort(_lib.sort === 'name' ? (a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }) : (a, b) => Library.sortTime(b) - Library.sortTime(a));
+  return (_allCache = l);
+}
+function pageOfAll() { return sortedAll().slice(0, _lib.shown); }
+function moreButton() {
+  if (document.querySelector('.file-tab.active')?.dataset.tab !== 'all' || !_allCache) return '';
+  const hidden = _allCache.length - _lib.shown;
+  return hidden > 0 ? `<button class="btn btn-secondary" id="lib-more" style="margin:12px auto;display:block">Show ${Math.min(PAGE, hidden)} more (${hidden} hidden)</button>` : '';
+}
+
+function renderLibraryBar(el) {
+  const keep = document.activeElement?.id === 'lib-search' ? document.activeElement.selectionStart : null;
+  const acc = Library.accessSummary(), st = Library.status();
+  const total = _allCache ? _allCache.length : Library.allFiles().length;
+  let card = '';
+  if (acc.state === 'off' || acc.state === 'denied') {
+    card = `<div class="ondevice-note"><strong>${acc.state === 'denied' ? 'Access wasn’t allowed.' : 'See all your phone’s PDFs here.'}</strong> ${acc.state === 'denied'
+      ? 'FYLO still shows PDFs you open or create. You can open a file with <em>Open PDF</em>, choose folders, or allow access later.'
+      : 'Allow access once and FYLO lists the PDFs on your phone next to the ones it creates — opened in place, never copied.'}
+      <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap"><button class="btn btn-primary btn-sm" id="lib-allow">${acc.state === 'denied' ? 'Try again' : 'Allow access'}</button><button class="btn btn-secondary btn-sm" id="lib-folders">Choose folders instead</button><button class="btn btn-secondary btn-sm" id="lib-why">Details</button></div></div>`;
+  } else if (acc.state === 'folders_only') {
+    card = `<div class="ondevice-note">On Android 10, FYLO can only list PDFs in folders you choose. <button class="btn btn-secondary btn-sm" id="lib-folders" style="margin-left:6px">Choose a folder</button></div>`;
+  }
+  const line = st.refreshing ? 'Looking for PDFs…'
+    : st.error ? `Couldn’t scan: ${esc(st.error)}`
+    : st.at ? `${total} PDF${total === 1 ? '' : 's'}${st.truncated ? ' (list limit reached — use a folder or search)' : ''}` : '';
+  el.innerHTML = `${card}
+    <div class="ondevice-toolbar">
+      <input type="text" class="input-field" id="lib-search" placeholder="Search PDFs…" value="${esc(_lib.q)}" autocomplete="off" aria-label="Search PDFs" style="flex:1;min-width:0">
+      <button class="btn btn-secondary btn-sm" id="lib-refresh" ${st.refreshing ? 'disabled' : ''}>Refresh</button>
+      <select class="select-field" id="lib-sort" aria-label="Sort" style="width:auto"><option value="recent" ${_lib.sort === 'recent' ? 'selected' : ''}>Newest</option><option value="name" ${_lib.sort === 'name' ? 'selected' : ''}>Name</option></select>
+    </div>
+    <div class="ondevice-status" id="lib-status">${line}</div>`;
+  el.querySelector('#lib-allow')?.addEventListener('click', () => Library.requestAccess());
+  el.querySelector('#lib-why')?.addEventListener('click', () => bus.emit('library:manageAccess', {}));
+  el.querySelector('#lib-folders')?.addEventListener('click', () => bus.emit('ondevice:addFolder', {}));
+  el.querySelector('#lib-refresh')?.addEventListener('click', () => { toast('Refreshing…', 1200); Library.refresh({}); });
+  el.querySelector('#lib-sort')?.addEventListener('change', e => { _lib.sort = e.target.value; _lib.shown = PAGE; renderFiles(); });
+  const inp = el.querySelector('#lib-search');
+  inp?.addEventListener('input', e => { _lib.q = e.target.value; _lib.shown = PAGE; renderFiles(); });
+  if (keep !== null && inp) { inp.focus(); try { inp.setSelectionRange(keep, keep); } catch { /* ignore */ } }
+}
+
+document.addEventListener('click', e => {
+  if (e.target.closest?.('#lib-more')) { _lib.shown += PAGE; renderFiles(); }
+});
+
+/** Opens a library file in the Reader — in place. Explains (instead of failing silently) when the file is gone. */
+async function openFile(id) {
+  const f = State.getFile(id);
+  if (!f) { toast('File not found'); return; }
+  if (f.size > MAX_OPEN_BYTES) { toast(`This PDF is ${fmtBytes(f.size)} — too large to open safely in FYLO.`, 5000); return; }
+  if (f.ref) {
+    const chk = await Library.checkOpenable(f);
+    if (!chk.ok) { explainUnavailable(f, chk); return; }
+  }
+  bus.emit('reader:openRequest', { fileId: id });
+}
+
+function explainUnavailable(f, chk) {
+  const revoked = chk.code === 'ACCESS_REVOKED';
+  openModal(revoked ? 'No access to this file' : 'File not found',
+    `<p><strong>${esc(f.name)}</strong></p><p style="margin-top:8px">${revoked
+      ? 'Android no longer lets FYLO read this PDF (permission was turned off, or the folder access was removed).'
+      : 'This PDF was moved or deleted outside FYLO.'}</p>`,
+    `<button class="btn btn-secondary modal-cancel">Close</button>${revoked ? '<button class="btn btn-secondary" id="unav-allow">Allow access</button>' : ''}<button class="btn btn-primary" id="unav-remove">Remove from list</button>`);
+  document.querySelector('.modal-cancel')?.addEventListener('click', closeModal);
+  document.getElementById('unav-allow')?.addEventListener('click', () => { closeModal(); bus.emit('library:manageAccess', {}); });
+  document.getElementById('unav-remove')?.addEventListener('click', async () => { closeModal(); await Library.forget(f.id); renderFiles(); renderRecent(); });
+}
+bus.on('files:open', ({ fileId }) => openFile(fileId));
+bus.on('library:changed', () => { if (document.querySelector('.file-tab.active')?.dataset.tab === 'all') renderFiles(); });
 
 // ── Wire file tabs ───────────────────────────────────────────────────────────
 function selectTab(name) {
@@ -272,6 +386,11 @@ function wireFileTabs() {
   document.querySelectorAll('.file-tab').forEach(tab => {
     tab.addEventListener('click', () => selectTab(tab.dataset.tab));
   });
+  // On Android the unified library ("All PDFs": phone + FYLO-made + opened) is the home of the Files screen.
+  if (Device.isAndroid) {
+    document.getElementById('tab-all')?.classList.remove('hidden');
+    selectTab('all');
+  }
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -287,8 +406,8 @@ export const FilesModule = {
 };
 
 // ── Bus listeners ─────────────────────────────────────────────────────────────
-bus.on('files:incoming',      ({ files, onSaved, requirePersist })  => {
-  handleFiles(files, { requirePersist }).then(ids => onSaved?.(ids)).catch(e => { log.error('files:incoming failed:', e); onSaved?.([]); });
+bus.on('files:incoming',      ({ files, onSaved, requirePersist, generated })  => {
+  handleFiles(files, { requirePersist, generated }).then(ids => onSaved?.(ids)).catch(e => { log.error('files:incoming failed:', e); onSaved?.([]); });
 });
 bus.on('files:render',        ()                    => renderFiles());
 bus.on('files:selectTab',     ({ tab })             => selectTab(tab));

@@ -157,12 +157,19 @@ The bridge is exposed as `window.AndroidBridge` inside the WebView.
 | `pickPdfFolder()` → `window.fyloNativeResult('folderPicked', json)` | — | void | SAF folder picker (persisted read grant) |
 | `getPdfFolders()` / `removePdfFolder(uri)` | | JSON / void | Granted folders (`accessible:false` = revoked) |
 | `listPdfs(requestId, treeUri)` → `fyloNativeResult(requestId, json)` / `cancelScan(requestId)` | | void | Background PDF listing (limits: 5000 files, 2500 folders, depth 8, 25 s; reports `truncated`) |
+| `getStorageAccess()` | — | JSON `{sdk,mode,granted}` | `mode`: `all_files` (API 30+), `read_storage` (API 26–28), `folders_only` (API 29) |
+| `requestStorageAccess()` → `fyloNativeResult('storageAccess', json)` | — | void | API 30+: opens the system **All files access** screen (not a popup); result is posted when the app resumes. API 26–28: runtime READ_EXTERNAL_STORAGE dialog |
+| `discoverPdfs(requestId, deep)` → `fyloNativeResult(requestId, json)` | | void | `{ok,files:[{path,name,size,modified}],truncated}`. Quick = MediaStore index; deep = also walks storage (limits 20 000 files, 90 s) |
+| `statPdfs(requestId, jsonArray)` | | void | Existence/permission check for paths or content URIs → `{items:[{path,allowed,exists,size}]}` |
+| `pickPdfDocuments()` → `fyloNativeResult('docsPicked', json)` / `releaseDocument(uri)` | | void | "Open PDF" picker that keeps a persisted read grant per document so it is opened in place |
 | `onWebCleanupDone(changed)` / `onWebCleanupFailed(msg)` | | void | Callbacks from the injected post-update cleanup script |
 | `requestCameraPermission()` / `hasCameraPermission()` | | void / boolean | Camera permission |
 | `openFilePicker(mimeTypesCsv)`, `showToast(msg)`, `getPlatform()`, `getAndroidVersion()` | | | as before |
 
 PDFs inside a chosen folder are streamed to the web layer through the WebViewAssetLoader origin at
-`/saf/doc?u=<content-uri>` (only URIs under a folder the user granted are served) — no base64 over the bridge.
+`/saf/doc?u=<content-uri>` (only URIs under a granted folder or individually picked/granted documents are served) — no base64 over the bridge.
+PDFs on shared storage stream from `/dev/doc?p=<absolute path>` (PDF files inside shared storage only; never other apps' `Android/data|obb`;
+needs All-files access) and FYLO's own MediaStore saves from `/dev/doc?u=<content://media/…>`.
 
 **Web → Android result callbacks:**
 
@@ -214,10 +221,19 @@ On Android: chunked `saveBegin/saveChunk/saveEnd` with native size verification;
 | `CAMERA` | Optional | Document scanning (`getUserMedia`) |
 | `INTERNET` | Optional | CDN fallback if local libs missing |
 
-No storage permissions are requested. Saving uses MediaStore (API 29+) or app-specific storage (API 26–28).
-**On Device browsing uses the Storage Access Framework**: the user picks folders; FYLO can only see those folders.
-Android 11+ will not let any app be granted the root of internal storage, `Android/data`, or (on many devices) the
-top-level `Download` folder — pick a folder *inside* it, or `Documents`. FYLO does not claim to see "all PDFs on the phone".
+| `MANAGE_EXTERNAL_STORAGE` | Optional (API 30+) | "All files access": lets FYLO list PDFs anywhere on shared storage and open them in place. Granted by the user on a **system Settings screen**, not a popup. Sideload-only: Google Play does not allow this for a PDF utility |
+| `READ_EXTERNAL_STORAGE` (≤ API 28) | Optional | Same purpose on Android 8–9 |
+
+Everything works without the storage permissions: saving uses MediaStore (API 29+) / app-specific storage (API 26–28), the **Open PDF** picker and
+folders chosen through the Storage Access Framework keep working. Android 10 has no whole-storage grant for apps targeting 30+, so it is folders-only.
+
+### Unified library & storage rules
+- One list ("All PDFs"): PDFs found on the phone + PDFs FYLO made + PDFs the user opened/imported. The same physical file is listed once (key = canonical path; SAF document ids are mapped to paths).
+- **Nothing is copied to browse or open.** A library record for a file kept elsewhere is metadata only (`ref`, name, size, a small thumbnail); the bytes are streamed from the original location each time (`DeviceBlob`). Discovery results live in memory only and are rebuilt from Android at launch.
+- **New PDFs (Scan, Merge, Split, Compress, …) are saved once** to `Download/FYLO` (Settings → *Save new PDFs to*; "Inside FYLO only" keeps the old internal storage). No second download, no private duplicate. If the shared save fails, the PDF is kept inside FYLO rather than lost.
+- Originals are never overwritten: tools write a new file. "Remove from FYLO" on a referenced PDF only deletes the record — FYLO never deletes files on the phone.
+- Backup (Export Data) includes only PDFs stored inside FYLO; referenced PDFs are listed in `files.json` with their location, not duplicated.
+- Missing / moved / permission-revoked files are flagged (*Missing* / *No access*) and explained on tap; refresh and a bounded deep scan are available.
 
 ---
 
@@ -225,7 +241,7 @@ top-level `Download` folder — pick a folder *inside* it, or `Documents`. FYLO 
 
 - WebView only loads `file:///android_asset/www/**` — no arbitrary URLs
 - External URLs open in system browser (not in the WebView)
-- JavaScript bridge exposes scoped file/SAF methods only — no shell; `/saf/doc` serves only URIs under user-granted folders
+- JavaScript bridge exposes scoped file/SAF methods only — no shell; `/saf/doc` serves only granted folders/documents; `/dev/doc` serves only `.pdf` files inside shared storage (and requires All-files access) or FYLO's own MediaStore items
 - FileProvider restricts share URIs to app cache only
 - `cleartextTrafficPermitted="false"` in network_security_config.xml
 - No hardcoded keys, secrets, or passwords
@@ -247,9 +263,13 @@ Android installs an APK as an update only when **(1) `applicationId` is unchange
 
 1. Bump `APP_VERSION` in `fylo-web/core/constants.js` (e.g. `2.1.0` → `2.1.1`). This is the *only* version source:
    Gradle derives `versionName` and `versionCode = MAJOR*10000 + MINOR*100 + PATCH`; the Service Worker cache name and Settings → Version use it too.
-2. Build with the **same signing key every time**. Default is the machine's debug key; to make builds from other machines/CI
-   update each other, create `fylo-android/keystore.properties` (git-ignored: `storeFile`, `storePassword`, `keyAlias`, `keyPassword`).
-   If the key ever changes, Android answers `INSTALL_FAILED_UPDATE_INCOMPATIBLE` — back up first (Settings → Export Data), then uninstall once.
+2. Build with the **same signing key every time**. Builds are now signed with the committed
+   `fylo-android/signing/fylo-signing.keystore` (alias `fylo`; SHA-256 in `signing/expected-cert-sha256.txt`) on every machine **and in GitHub Actions**.
+   Before this, each CI run generated a brand-new random debug key, so each APK had a different certificate and Android answered "App not installed".
+   Use your own key instead by creating `fylo-android/keystore.properties` (git-ignored: `storeFile`, `storePassword`, `keyAlias`, `keyPassword`) or, in CI,
+   the secrets `FYLO_KEYSTORE_B64`, `FYLO_KEYSTORE_PASSWORD`, `FYLO_KEY_ALIAS`, `FYLO_KEY_PASSWORD`. **Never change keys once the app is installed anywhere.**
+   The committed key's password is public: it is a convenience key for personal/sideloaded builds, not a store-release secret.
+   `bash scripts/verify-apk.sh new.apk --previous old.apk` compares package name, signing certificate and versionCode of two APKs.
 3. `adb install -r app-debug.apk` (or just open the APK on the phone). Data in IndexedDB survives an update.
 
 Why old builds kept showing: a cache-first Service Worker (fixed cache name) and Cache Storage inside the WebView could serve the old app

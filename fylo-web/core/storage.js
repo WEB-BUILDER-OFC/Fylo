@@ -8,6 +8,7 @@ import { DB_NAME, DB_VERSION, DB_STORES } from './constants.js';
 import { createLogger } from './logger.js';
 import { bus, EVENTS } from './eventBus.js';
 import { Actions } from './state.js';
+import { hydrate } from './deviceblob.js';
 
 const log = createLogger('Storage');
 
@@ -84,11 +85,19 @@ export const storage = {
 
 // ── Typed helpers — import these in feature modules ───────────────────────────
 
+// Records that point at a PDF kept elsewhere (`ref`) are stored as metadata only — never a blob, never a copy.
+// Runtime-only flags (missing / noAccess) are not persisted either.
+const _persistable = file => {
+  if (!file || !file.ref) return file;
+  const { blob, missing, noAccess, ...meta } = file;   // eslint-disable-line no-unused-vars
+  return meta;
+};
+
 export const FileStorage = {
-  save:    file    => storage.put(DB_STORES.FILES, file),
-  load:    id      => storage.get(DB_STORES.FILES, id),
+  save:    file    => storage.put(DB_STORES.FILES, _persistable(file)),
+  load:    async id => hydrate(await storage.get(DB_STORES.FILES, id)),
   remove:  id      => storage.delete(DB_STORES.FILES, id),
-  loadAll: ()      => storage.getAll(DB_STORES.FILES),
+  loadAll: async () => (await storage.getAll(DB_STORES.FILES)).map(hydrate),
 };
 
 export const BookmarkStorage = {
