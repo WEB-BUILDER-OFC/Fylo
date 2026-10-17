@@ -41,7 +41,18 @@ for lib in pdf-lib.min.js pdf.min.js pdf.worker.min.js; do
 done
 echo "--- signing certificate (an update is only accepted if this matches the installed app) ---"
 APKSIGNER=$(ls "${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1 || true)
-cert() { "$APKSIGNER" verify --print-certs "$1" 2>/dev/null | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -1; }
+cert() {
+  # apksigner first; keytool as a fallback (its output format differs between versions, so parse loosely).
+  local out c
+  out=$("$APKSIGNER" verify --print-certs "$1" 2>&1 || true)
+  c=$(grep -i 'certificate SHA-256 digest' <<<"$out" | head -1 | sed 's/.*: *//' | tr -d ' \r')
+  if [ -z "$c" ]; then
+    out=$(keytool -printcert -jarfile "$1" 2>&1 || true)
+    c=$(grep -i 'SHA256:' <<<"$out" | head -1 | sed 's/.*SHA256: *//' | tr -d ': \r' | tr 'A-F' 'a-f')
+  fi
+  if [ -z "$c" ]; then echo "DEBUG could not read a signer from $1:" >&2; echo "$out" | head -8 >&2; fi
+  tr 'A-F' 'a-f' <<<"$c"
+}
 if [ -z "$APKSIGNER" ]; then
   echo "WARN apksigner not found - cannot check the signing certificate"; fail=1
 else

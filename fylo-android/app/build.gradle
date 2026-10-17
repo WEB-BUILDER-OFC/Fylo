@@ -56,6 +56,8 @@ android {
             storePassword fyloStorePass
             keyAlias fyloKeyAlias
             keyPassword fyloKeyPass
+            v1SigningEnabled true      // also lets keytool read the signer if apksigner output ever changes
+            v2SigningEnabled true
         }
     }
 
