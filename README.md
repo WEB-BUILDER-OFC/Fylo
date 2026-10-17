@@ -279,6 +279,12 @@ Browsers/PWA: the SW cache name is `fylo-v<APP_VERSION>`, so each release replac
 
 ---
 
+### Diagnosing "App not installed"
+1. Every CI run uploads `apk-report.txt` next to the APK (package, versionCode, SDK, ABI, signer SHA-256, `apksigner verify` output).
+2. With the phone attached (USB debugging): `bash fylo-android/scripts/diagnose-update.sh app-debug.apk` pulls the installed APK, compares package / signer / versionCode, and runs `adb install -r`, printing the exact `[INSTALL_FAILED_…]` code.
+3. Without a PC: extract the installed APK with an app like App Manager and run the script with both files, or compare the signer SHA-256 it shows with the one in `apk-report.txt`.
+4. From 2.2.1 on, Settings → Version shows the first 8 hex digits of the key the running app is signed with (`key e509a730…` = the committed FYLO key).
+
 ## Testing status
 
 Automated (headless Chromium, `tests/web/` — run `python3 tests/web/make_fixtures.py` then the `*.mjs` suites with Playwright):

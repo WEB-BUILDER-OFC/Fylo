@@ -464,6 +464,28 @@ public class MainActivity extends AppCompatActivity {
      * Identifies the installed build. Changes on every update (versionCode) and on every re-install of the
      * same version (lastUpdateTime), so stale web caches are never trusted across either.
      */
+    /** SHA-256 of the certificate this install is signed with (an update must be signed by the same one). */
+    @SuppressWarnings("deprecation")
+    private String signerSha256() {
+        try {
+            android.content.pm.Signature[] sigs;
+            if (android.os.Build.VERSION.SDK_INT >= 28) {
+                PackageInfo p = getPackageManager().getPackageInfo(getPackageName(), PackageManager.GET_SIGNING_CERTIFICATES);
+                sigs = p.signingInfo == null ? null : (p.signingInfo.hasMultipleSigners()
+                        ? p.signingInfo.getApkContentsSigners() : p.signingInfo.getSigningCertificateHistory());
+            } else {
+                sigs = getPackageManager().getPackageInfo(getPackageName(), PackageManager.GET_SIGNATURES).signatures;
+            }
+            if (sigs == null || sigs.length == 0) return "";
+            byte[] d = java.security.MessageDigest.getInstance("SHA-256").digest(sigs[0].toByteArray());
+            StringBuilder sb = new StringBuilder();
+            for (byte b : d) sb.append(String.format("%02x", b));
+            return sb.toString();
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
     private String installStamp() {
         try {
             PackageInfo p = getPackageManager().getPackageInfo(getPackageName(), 0);
@@ -810,7 +832,7 @@ public class MainActivity extends AppCompatActivity {
                 PackageInfo p = getPackageManager().getPackageInfo(getPackageName(), 0);
                 return FileSaver.json("versionName", p.versionName, "versionCode", p.versionCode,
                         "lastUpdateTime", p.lastUpdateTime, "packageName", getPackageName(),
-                        "sdk", android.os.Build.VERSION.SDK_INT);
+                        "sdk", android.os.Build.VERSION.SDK_INT, "signerSha256", signerSha256());
             } catch (Exception e) {
                 return FileSaver.json("error", FileSaver.describe(e));
             }

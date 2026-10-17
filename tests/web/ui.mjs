@@ -10,7 +10,7 @@ for (const mode of ['web', 'android']) {
   rec(G, 'boots with no page errors', s.logs.errors.length === 0, s.logs.errors.join('|'));
   // ---- service worker policy
   const regs = await p.evaluate(async () => (await navigator.serviceWorker.getRegistrations()).map(r => r.active?.scriptURL || r.installing?.scriptURL || ''));
-  if (mode === 'web') rec(G, 'SW registered with version-keyed URL', regs.some(u => u.includes('sw.js?v=2.2.0')), regs.join());
+  if (mode === 'web') rec(G, 'SW registered with version-keyed URL', regs.some(u => u.includes('sw.js?v=2.2.1')), regs.join());
   else rec(G, 'SW NOT registered inside Android wrapper', regs.length === 0, regs.join());
   // ---- hamburger
   const aria0 = await p.getAttribute('#menu-btn', 'aria-expanded');
@@ -50,8 +50,8 @@ for (const mode of ['web', 'android']) {
   const stxt = await p.locator('#page-settings, .page.active').first().innerText();
   rec(G, 'Settings has no "Built With"', !/built with/i.test(await p.content().then(h => h.replace(/<script[\s\S]*?<\/script>/g, ''))));
   const ver = await p.locator('#about-version').innerText();
-  rec(G, 'Version displayed', /2\.2\.0/.test(ver), ver);
-  if (mode === 'android') rec(G, 'Android build number displayed', /20200/.test(ver), ver);
+  rec(G, 'Version displayed', /2\.2\.1/.test(ver), ver);
+  if (mode === 'android') rec(G, 'Android build number displayed', /20201/.test(ver), ver);
   rec(G, 'Compress-level and image-format settings present', (await p.locator('#setting-compress-level').count()) === 1 && (await p.locator('#setting-image-format').count()) === 1);
   rec(G, 'PDF folders setting only on Android', (await p.locator('#setting-folders').isVisible()) === (mode === 'android'));
   s.mode = mode; await s.close();

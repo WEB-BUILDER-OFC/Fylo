@@ -62,7 +62,8 @@ function _renderVersion() {
   // Native and web versions come from the same constant at build time. If they ever disagree, an old web
   // bundle is being served — say so instead of hiding it.
   const same = info.versionName === APP_VERSION;
-  el.textContent = `FYLO v${info.versionName} (build ${info.versionCode})` + (same ? '' : ` — ⚠ showing web files v${APP_VERSION}; fully close and reopen FYLO`);
+  el.textContent = `FYLO v${info.versionName} (build ${info.versionCode})` + (same ? '' : ` — ⚠ showing web files v${APP_VERSION}; fully close and reopen FYLO`)
+    + (info.signerSha256 ? ` · key ${info.signerSha256.slice(0, 8)}…` : '');
 }
 
 // ── Render settings page ──────────────────────────────────────────────────────

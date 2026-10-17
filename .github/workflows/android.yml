@@ -87,11 +87,36 @@ jobs:
           echo "=== PDF libs in APK ==="
           unzip -l "$APK" | grep "assets/libs" || echo "WARNING: no libs found"
 
+      - name: Write APK identity report (evidence for update problems)
+        if: always()
+        working-directory: fylo-android
+        run: |
+          export ANDROID_HOME="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          R=app/build/outputs/apk/debug/apk-report.txt
+          {
+            echo "# FYLO APK identity report ($(date -u +%FT%TZ)) commit ${GITHUB_SHA}"
+            echo "## file"; sha256sum "$APK"; ls -l "$APK"
+            echo "## aapt badging (package / versionCode / sdk / abi)"
+            "$BT/aapt" dump badging "$APK" | grep -E "^package:|^sdkVersion|^targetSdkVersion|^native-code|^application-debuggable|testOnly|^uses-permission" || true
+            echo "## apksigner verify -v --print-certs (exit code follows)"
+            "$BT/apksigner" verify -v --print-certs "$APK" 2>&1; echo "apksigner exit code: $?"
+            echo "## keytool -printcert -jarfile (v1 signature)"
+            keytool -printcert -jarfile "$APK" 2>&1 | grep -E "Owner|SHA256|Valid|Signature algorithm" || echo "(no v1 signature / unreadable)"
+            echo "## zipalign check"; "$BT/zipalign" -c -v 4 "$APK" 2>&1 | tail -2
+            echo "## expected committed-key fingerprint"; cat signing/expected-cert-sha256.txt
+            echo "## signing mode"; if [ -f keystore.properties ]; then echo "keystore.properties present (YOUR key from secrets)"; else echo "committed fylo-signing.keystore"; fi
+          } > "$R" 2>&1 || true
+          cat "$R"
+
       - name: Upload debug APK
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: fylo-debug-apk
-          path: fylo-android/app/build/outputs/apk/debug/app-debug.apk
+          path: |
+            fylo-android/app/build/outputs/apk/debug/app-debug.apk
+            fylo-android/app/build/outputs/apk/debug/apk-report.txt
           if-no-files-found: error
           retention-days: 30
